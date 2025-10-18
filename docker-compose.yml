@@ -1,0 +1,50 @@
+version: '3.8'
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: fuhubsign-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - fuhubsign-network
+
+  server:
+    build:
+      context: .
+      dockerfile: ./server/Dockerfile
+    container_name: fuhubsign-server
+    ports:
+      - "3000:3001"
+    environment:
+      - NODE_ENV=production
+      - PORT=3001
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_DB=0
+      - API_BASE_URL=https://h5-proxy.fdcompute.com
+      - TOKEN_REFRESH_INTERVAL=300000
+      - TASK_CHECK_INTERVAL=60000
+      - LOG_LEVEL=info
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./server/logs:/app/logs
+    networks:
+      - fuhubsign-network
+    restart: unless-stopped
+
+volumes:
+  redis-data:
+
+networks:
+  fuhubsign-network:
+    driver: bridge
