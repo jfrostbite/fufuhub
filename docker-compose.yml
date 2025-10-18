@@ -19,7 +19,7 @@ services:
   server:
     build:
       context: .
-      dockerfile: ./server/Dockerfile
+      dockerfile: ./Dockerfile
     container_name: fuhubsign-server
     ports:
       - "3000:3001"

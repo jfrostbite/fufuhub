@@ -29,7 +29,9 @@ export default function Dashboard() {
     // Connect to WebSocket
     // If on port 3000, use 3001 (backend); otherwise use same port
     const wsPort = window.location.port === '3000' ? '3001' : window.location.port;
-    const wsUrl = `ws://${window.location.hostname}:${wsPort}`;
+    // Use wss:// for HTTPS, ws:// for HTTP
+    const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const wsUrl = `${wsProtocol}//${window.location.hostname}:${wsPort}`;
     console.log('Connecting to WebSocket:', wsUrl);
     
     const wsConnection = new WebSocket(wsUrl);
