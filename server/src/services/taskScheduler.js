@@ -6,7 +6,7 @@ import { broadcastToClients } from '../index.js';
 
 /**
  * 每天一次的签到任务调度器
- * 每天 8-9 点的随机时间触发
+ * 每天北京时间 8-9 点的随机时间触发（Asia/Shanghai 时区）
  * 1. 获取一次任务列表
  * 2. 按照任务条件（如 90 分钟等待）执行完成
  * 不频繁请求上游接口
@@ -15,6 +15,8 @@ export class TaskScheduler {
   constructor() {
     this.jobs = new Map();
     this.isRunning = false;
+    // 使用北京时区（Asia/Shanghai, UTC+8）
+    this.timezone = process.env.SCHEDULER_TIMEZONE || 'Asia/Shanghai';
   }
 
   async initialize() {
@@ -47,8 +49,8 @@ export class TaskScheduler {
     }
 
     this.isRunning = true;
-    logger.info('TaskScheduler started - Daily execution mode (8-9 AM random time)');
-    this.addSystemLog('✅ 调度器已启动 - 每天 8-9 点随机执行一次 (Daily mode)', 'success');
+    logger.info(`TaskScheduler started - Daily execution mode (8-9 AM ${this.timezone})`);
+    this.addSystemLog(`✅ 调度器已启动 - 每天北京时间 8-9 点随机执行 (Timezone: ${this.timezone})`, 'success');
 
     // Schedule daily task execution at random time between 8-9 AM
     this.scheduleDailyExecution();
@@ -69,52 +71,55 @@ export class TaskScheduler {
 
   /**
    * Schedule daily sign-in task execution
-   * Random time between 8-9 AM every day
+   * Random time between 8-9 AM Beijing Time (Asia/Shanghai)
    */
   scheduleDailyExecution() {
-    // CronJob: Run at 8 AM with random minute/second
-    // 0 8 * * * = Every day at 8:00 AM
-    // But we'll add randomness in the execution
-    const job = schedule.scheduleJob('0 8 * * *', async () => {
-      if (!this.isRunning) {
-        logger.info('Scheduler not running, skipping daily execution');
-        return;
-      }
-
-      // Add random delay (0-60 minutes) to spread execution between 8-9 AM
-      const randomDelay = Math.floor(Math.random() * 60) * 1000; // 0-60 minutes in ms
-      const randomMinutes = Math.floor(randomDelay / 60000);
-
-      logger.info(`Daily execution trigger at 8 AM, scheduling for +${randomMinutes} minutes`);
-
-      setTimeout(async () => {
-        if (!this.isRunning) return;
-
-        const users = await this.loadUsers();
-        logger.info(`[Daily Execution] Starting for ${users.length} users`);
-        this.addSystemLog(`📅 开始每日签到执行 (${users.length} 个账户) - Daily sign-in started`, 'info');
-
-        for (const user of users) {
-          if (user.isActive) {
-            try {
-              await this.executeDailySignIn(user);
-            } catch (error) {
-              logger.error(`[Daily] Error for user ${user.uid}:`, error.message);
-              this.addSystemLog(
-                `❌ 用户 ${user.uid} 执行失败: ${error.message}`,
-                'error'
-              );
-            }
-          }
+    // CronJob: Run at 8 AM Beijing Time with random minute/second
+    // 0 8 * * * = Every day at 8:00 AM in specified timezone
+    // Add timezone option to ensure Beijing time regardless of server location
+    const job = schedule.scheduleJob(
+      { hour: 8, minute: 0, tz: this.timezone },
+      async () => {
+        if (!this.isRunning) {
+          logger.info('Scheduler not running, skipping daily execution');
+          return;
         }
 
-        logger.info('[Daily Execution] Completed');
-        this.addSystemLog('✅ 每日签到执行完成 (Daily sign-in completed)', 'success');
-      }, randomDelay);
-    });
+        // Add random delay (0-60 minutes) to spread execution between 8-9 AM
+        const randomDelay = Math.floor(Math.random() * 60 * 60 * 1000); // 0-60 minutes in ms
+        const randomMinutes = Math.floor(randomDelay / 60000);
+
+        logger.info(`Daily execution trigger at 8 AM ${this.timezone}, scheduling for +${randomMinutes} minutes`);
+
+        setTimeout(async () => {
+          if (!this.isRunning) return;
+
+          const users = await this.loadUsers();
+          logger.info(`[Daily Execution] Starting for ${users.length} users`);
+          this.addSystemLog(`📅 开始每日签到执行 (${users.length} 个账户) - Daily sign-in started`, 'info');
+
+          for (const user of users) {
+            if (user.isActive) {
+              try {
+                await this.executeDailySignIn(user);
+              } catch (error) {
+                logger.error(`[Daily] Error for user ${user.uid}:`, error.message);
+                this.addSystemLog(
+                  `❌ 用户 ${user.uid} 执行失败: ${error.message}`,
+                  'error'
+                );
+              }
+            }
+          }
+
+          logger.info('[Daily Execution] Completed');
+          this.addSystemLog('✅ 每日签到执行完成 (Daily sign-in completed)', 'success');
+        }, randomDelay);
+      }
+    );
 
     this.jobs.set('dailyExecution', job);
-    logger.info('Daily execution scheduled for 8 AM (random time between 8-9 AM)');
+    logger.info(`Daily execution scheduled for 8 AM ${this.timezone} (random time between 8-9 AM)`);
   }
 
   /**
@@ -422,89 +427,79 @@ export class TaskScheduler {
   }
 
   /**
-   * Process a single task with wait conditions
-   * Handle cases like "90 minute wait" before completion
+   * Process a single task based on task type
+   * Type 1: Sign-in tasks - can be executed immediately
+   * Type 2: Time-consuming tasks - check progress completion (task_value/task_target)
+   * Type 3: Ignored for now
    */
   async processDailyTask(user, userData, task) {
     try {
       logger.info(
-        `[Task] Processing task ${task.task_id} (${task.task_name}) for user ${user.uid}`
+        `[Task] Processing task ${task.task_id} (${task.task_name}) Type: ${task.task_type} for user ${user.uid}`
       );
 
-      // Get wait condition
-      const waitMinutes = this.extractWaitMinutes(task);
+      const taskType = task.task_type;
 
-      if (waitMinutes > 0) {
-        // Task has wait condition
-        logger.info(
-          `[Task] Task ${task.task_id} requires ${waitMinutes} minutes wait`
-        );
-
-        const taskWaitKey = `task:${user.uid}:${task.task_id}:waitUntil`;
-        const existingWaitTime = await redisClient.get(taskWaitKey);
-
-        if (!existingWaitTime) {
-          // First time seeing this task, schedule it for later
-          const waitUntil = Date.now() + waitMinutes * 60 * 1000;
-          await redisClient.set(taskWaitKey, waitUntil.toString());
-
-          const waitHours = (waitMinutes / 60).toFixed(1);
-          logger.info(
-            `[Task] Scheduled task ${task.task_id} for completion after ${waitMinutes} minutes`
-          );
-          this.addSystemLog(
-            `⏱️ 任务 ${task.task_id} 需等待 ${waitMinutes} 分钟后完成 (Wait ${waitMinutes} min before completion)`,
-            'warning'
-          );
-
-          broadcastToClients({
-            type: 'taskWaiting',
-            uid: user.uid,
-            taskId: task.task_id,
-            taskName: task.task_name,
-            waitMinutes,
-            scheduledTime: new Date(waitUntil).toISOString(),
-            timestamp: new Date().toISOString(),
-          });
-
-          return;
-        }
-
-        // Check if wait time has elapsed
-        const waitUntilTime = parseInt(existingWaitTime);
-        const now = Date.now();
-
-        if (now >= waitUntilTime) {
-          logger.info(
-            `[Task] Wait time elapsed for task ${task.task_id}, executing completion now`
-          );
-          this.addSystemLog(
-            `✅ 任务 ${task.task_id} 等待时间已满，开始完成 (Task wait complete, executing)`,
-            'info'
-          );
-
-          await redisClient.del(taskWaitKey);
-          await this.completeTaskCall(user, userData, task);
-        } else {
-          const remainingMinutes = Math.ceil((waitUntilTime - now) / 60000);
-          logger.info(
-            `[Task] Task ${task.task_id} still waiting, ${remainingMinutes} minutes remaining`
-          );
-          this.addSystemLog(
-            `⏳ 任务 ${task.task_id} 继续等待 ${remainingMinutes} 分钟 (Waiting ${remainingMinutes} more minutes)`,
-            'warning'
-          );
-        }
-      } else {
-        // No wait condition, complete immediately
-        logger.info(`[Task] Task ${task.task_id} can be completed immediately`);
+      // Type 3: Ignore
+      if (taskType === 3) {
+        logger.info(`[Task] Task ${task.task_id} is Type 3, ignoring`);
         this.addSystemLog(
-          `✅ 任务 ${task.task_id} 可立即完成 (Ready to complete immediately)`,
+          `⏭️ 任务 ${task.task_id} (Type 3) 已跳过 (Task Type 3 skipped)`,
           'info'
         );
-
-        await this.completeTaskCall(user, userData, task);
+        return;
       }
+
+      // Type 1: Sign-in tasks - execute immediately
+      if (taskType === 1) {
+        logger.info(`[Task] Task ${task.task_id} is Type 1 (sign-in), can be completed immediately`);
+        this.addSystemLog(
+          `✅ 任务 ${task.task_id} (签到任务) 可立即完成 (Sign-in task ready to complete)`,
+          'info'
+        );
+        await this.completeTaskCall(user, userData, task);
+        return;
+      }
+
+      // Type 2: Time-consuming tasks - check progress
+      if (taskType === 2) {
+        const progress = task.task_value || 0;
+        const target = task.task_target || 0;
+        
+        logger.info(
+          `[Task] Task ${task.task_id} is Type 2 (time-consuming), Progress: ${progress}/${target}`
+        );
+
+        if (progress >= target) {
+          // Progress is complete, can execute task
+          logger.info(
+            `[Task] Task ${task.task_id} progress complete (${progress}/${target}), executing completion`
+          );
+          this.addSystemLog(
+            `✅ 任务 ${task.task_id} 进度已完成 ${progress}/${target}，开始完成任务 (Progress complete, executing task)`,
+            'success'
+          );
+          await this.completeTaskCall(user, userData, task);
+        } else {
+          // Progress not complete yet
+          const remaining = target - progress;
+          logger.info(
+            `[Task] Task ${task.task_id} progress incomplete (${progress}/${target}), ${remaining} remaining`
+          );
+          this.addSystemLog(
+            `⏳ 任务 ${task.task_id} 进度未完成 ${progress}/${target}，还需 ${remaining} (Progress incomplete, ${remaining} remaining)`,
+            'warning'
+          );
+        }
+        return;
+      }
+
+      // Unknown task type
+      logger.warn(`[Task] Task ${task.task_id} has unknown type: ${taskType}`);
+      this.addSystemLog(
+        `⚠️ 任务 ${task.task_id} 类型未知 (Unknown task type: ${taskType})`,
+        'warning'
+      );
     } catch (error) {
       logger.error(
         `[Task] Failed to process task ${task.task_id}:`,
@@ -515,16 +510,6 @@ export class TaskScheduler {
         'error'
       );
     }
-  }
-
-  /**
-   * Extract wait minutes from task name
-   * Looks for patterns like "90分钟", "120分钟", etc.
-   */
-  extractWaitMinutes(task) {
-    const taskName = task.task_name || '';
-    const match = taskName.match(/(\d+)分钟/);
-    return match ? parseInt(match[1]) : 0;
   }
 
   /**
@@ -612,27 +597,31 @@ export class TaskScheduler {
   /**
    * Non-intrusive token refresh (every 4 hours)
    * Just to keep token fresh, not for frequent checks
+   * Uses the same timezone as daily execution
    */
   scheduleTokenRefresh() {
-    const job = schedule.scheduleJob('0 */4 * * *', async () => {
-      if (!this.isRunning) return;
+    const job = schedule.scheduleJob(
+      { hour: [0, 4, 8, 12, 16, 20], minute: 0, tz: this.timezone },
+      async () => {
+        if (!this.isRunning) return;
 
-      logger.info('[Token] Non-intrusive token refresh (every 4 hours)');
-      const users = await this.loadUsers();
+        logger.info('[Token] Non-intrusive token refresh (every 4 hours)');
+        const users = await this.loadUsers();
 
-      for (const user of users) {
-        if (user.isActive) {
-          try {
-            await this.refreshUserToken(user);
-          } catch (error) {
-            logger.warn(`[Token] Failed to refresh token for user ${user.uid}:`, error.message);
+        for (const user of users) {
+          if (user.isActive) {
+            try {
+              await this.refreshUserToken(user);
+            } catch (error) {
+              logger.warn(`[Token] Failed to refresh token for user ${user.uid}:`, error.message);
+            }
           }
         }
       }
-    });
+    );
 
     this.jobs.set('tokenRefresh', job);
-    logger.info('Token refresh scheduled every 4 hours');
+    logger.info(`Token refresh scheduled every 4 hours (${this.timezone})`);
   }
 
   /**

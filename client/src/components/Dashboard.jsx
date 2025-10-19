@@ -287,6 +287,32 @@ export default function Dashboard() {
     }
   };
 
+  const handleExecuteTasks = async (uid) => {
+    try {
+      addLog(`🚀 Starting manual task execution for user ${uid}...`, 'info');
+      
+      const response = await fetch(`/api/users/${uid}/execute-tasks`, {
+        method: 'POST',
+      });
+
+      const data = await response.json();
+
+      if (data.code === 0) {
+        addLog(`✅ Task execution started for user ${uid}`, 'success');
+        // Refresh tasks after a short delay
+        setTimeout(() => {
+          loadUserTasks(uid);
+          loadUserInfo(uid);
+        }, 2000);
+      } else {
+        addLog(`❌ Failed to execute tasks: ${data.message}`, 'error');
+      }
+    } catch (error) {
+      console.error('Failed to execute tasks:', error);
+      addLog('Failed to execute tasks', 'error');
+    }
+  };
+
   const handleCompleteTask = async (taskId) => {
     if (!selectedUser) return;
 
@@ -557,6 +583,12 @@ export default function Dashboard() {
                   <p>UID: {selectedUser.uid}</p>
                 </div>
                 <div className="user-actions">
+                  <button
+                    className="btn btn-success"
+                    onClick={() => handleExecuteTasks(selectedUser.uid)}
+                  >
+                    ▶️ Execute Tasks Now
+                  </button>
                   <button
                     className="btn btn-secondary"
                     onClick={() => handleRefreshToken(selectedUser.uid)}

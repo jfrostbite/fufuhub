@@ -16,6 +16,9 @@ RUN npm run build || echo "Build output:" && ls -la
 # Final stage
 FROM node:18-alpine
 
+# Install tzdata for timezone support
+RUN apk add --no-cache tzdata
+
 WORKDIR /app
 
 # Copy backend dependencies
@@ -30,6 +33,9 @@ COPY --from=builder /build-frontend/dist ./public
 
 # Create logs directory
 RUN mkdir -p logs
+
+# Set timezone environment variable (can be overridden by docker-compose)
+ENV TZ=Asia/Shanghai
 
 # Expose port
 EXPOSE 3001

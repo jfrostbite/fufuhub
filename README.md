@@ -8,7 +8,10 @@
 - **自动签到** - 自动登录并获取 Token
 - **智能 Token 管理** - 自动检测失效并刷新
 - **任务自动完成** - 按照任务列表自动执行
-- **时间感知调度** - 支持等待时间要求的任务（如 90 分钟、120 分钟）
+- **智能任务识别** - 支持基于任务类型的自动处理：
+  - Type 1（签到任务）- 立即执行
+  - Type 2（消耗时间任务）- 检查进度是否完成（如 90/90）后执行
+  - Type 3 - 暂时忽略
 - **错误自恢复** - Token 失效自动重新登录
 - **实时推送** - WebSocket 实时通知任务进度
 
@@ -250,6 +253,28 @@ GET /api/users/:uid/logs
 | `TOKEN_REFRESH_INTERVAL` | 300000 | Token 刷新间隔（ms） |
 | `TASK_CHECK_INTERVAL` | 60000 | 任务检查间隔（ms） |
 | `LOG_LEVEL` | info | 日志级别 |
+| `TZ` | Asia/Shanghai | 系统时区（确保无论服务器在哪都使用北京时间） |
+| `SCHEDULER_TIMEZONE` | Asia/Shanghai | 调度器时区（任务执行时间基准） |
+
+### ⏰ 时区配置说明
+
+**重要**：无论你的服务器部署在哪里（美国、欧洲、亚洲等），任务都会按照**北京时间（Asia/Shanghai, UTC+8）**的 8-9 点执行。
+
+- **默认时区**：`Asia/Shanghai`（北京时间）
+- **自动调度**：每天北京时间 8:00-9:00 随机时间执行
+- **Token 刷新**：每 4 小时（00:00, 04:00, 08:00, 12:00, 16:00, 20:00 北京时间）
+
+**如需修改时区**：
+1. 修改 `docker-compose.yml` 中的 `TZ` 和 `SCHEDULER_TIMEZONE` 环境变量
+2. 可选时区：`America/New_York`、`Europe/London`、`Asia/Tokyo` 等
+3. 重新启动容器：`docker compose up -d --build`
+
+**示例**：部署在美国但使用北京时间
+```yaml
+environment:
+  - TZ=Asia/Shanghai          # 系统时区
+  - SCHEDULER_TIMEZONE=Asia/Shanghai  # 调度器时区
+```
 
 ## 🎯 工作流程
 
@@ -263,9 +288,12 @@ GET /api/users/:uid/logs
     ├─ 获取用户信息 (getuserinfo)
     ├─ 获取任务列表 (getactivitytask)
     └─ 处理每个任务：
-        ├─ 检查任务状态
-        ├─ 如果有时间要求 → 等待指定时间
-        ├─ 时间到达 → 执行任务 (completetask)
+        ├─ 检查任务类型 (task_type)
+        ├─ Type 1 (签到任务) → 立即执行 (completetask)
+        ├─ Type 2 (消耗时间任务) → 检查进度 (task_value/task_target)
+        │   └─ 进度完成 → 执行任务 (completetask)
+        │   └─ 进度未完成 → 跳过并等待
+        ├─ Type 3 → 暂时忽略
         └─ 记录结果并推送前端
     ↓
 实时通过 WebSocket 推送进度到前端
@@ -286,12 +314,14 @@ GET /api/users/:uid/logs
 **可能原因**：
 1. Token 失效 → 尝试手动刷新 Token
 2. 任务已完成 → 查看任务状态
-3. 任务有时间限制 → 等待指定时间
+3. Type 2 任务进度未完成 → 等待进度达成
+4. Type 3 任务 → 系统会自动跳过
 
 **调试步骤**：
 1. 查看执行日志
-2. 检查 Redis 连接是否正常
-3. 查看服务器日志：`docker-compose logs -f server`
+2. 检查任务类型和进度（Type 1/2/3, Progress: x/y）
+3. 检查 Redis 连接是否正常
+4. 查看服务器日志：`docker-compose logs -f server`
 
 ### 问题：无法连接到 Redis
 

@@ -758,4 +758,55 @@ router.get('/system/logs', async (req, res) => {
   }
 });
 
+/**
+ * Manually execute daily tasks for a specific user
+ */
+router.post('/users/:uid/execute-tasks', async (req, res) => {
+  try {
+    let { uid } = req.params;
+    uid = parseInt(uid, 10);
+
+    const userData = await redisClient.get(`user:${uid}`);
+    if (!userData) {
+      return res.status(404).json({
+        code: 404,
+        message: 'User not found',
+      });
+    }
+
+    const user = JSON.parse(userData);
+    const scheduler = getTaskScheduler();
+    
+    if (!scheduler) {
+      return res.status(500).json({
+        code: 500,
+        message: 'Task Scheduler not available',
+      });
+    }
+
+    // Execute daily sign-in for this user
+    logger.info(`[Manual Execute] Starting manual task execution for user ${uid}`);
+    
+    // Run in background
+    scheduler.executeDailySignIn(user).catch(error => {
+      logger.error(`[Manual Execute] Failed for user ${uid}:`, error.message);
+    });
+
+    res.json({
+      code: 0,
+      message: 'Task execution started for user ' + uid,
+      data: {
+        uid: user.uid,
+        timestamp: new Date().toISOString(),
+      },
+    });
+  } catch (error) {
+    logger.error('Failed to execute tasks:', error);
+    res.status(500).json({
+      code: 500,
+      message: error.message,
+    });
+  }
+});
+
 export default router;
