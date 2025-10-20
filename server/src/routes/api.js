@@ -213,13 +213,8 @@ router.get('/users/:uid/info', async (req, res) => {
         // Refresh token from scheduler
         const scheduler = getTaskScheduler();
         if (scheduler) {
-          await scheduler.refreshUserToken(user);
-          // Refresh user data from Redis to get updated token
-          const updatedUserData = await redisClient.get(`user:${uid}`);
-          if (updatedUserData) {
-            const updatedUser = JSON.parse(updatedUserData);
-            user.token = updatedUser.token;
-          }
+          const updatedUserData = await scheduler.refreshUserToken(user);
+          user.token = updatedUserData.token;
         }
 
         // Retry the getUserInfo call
@@ -272,12 +267,8 @@ router.get('/users/:uid/info', async (req, res) => {
         
         const scheduler = getTaskScheduler();
         if (scheduler) {
-          await scheduler.refreshUserToken(user);
-          const updatedUserData = await redisClient.get(`user:${uid}`);
-          if (updatedUserData) {
-            const updatedUser = JSON.parse(updatedUserData);
-            user.token = updatedUser.token;
-          }
+          const updatedUserData = await scheduler.refreshUserToken(user);
+          user.token = updatedUserData.token;
         }
 
         // Retry tasks fetch
@@ -433,13 +424,8 @@ router.get('/users/:uid/rewards', async (req, res) => {
         // Refresh token from scheduler
         const scheduler = getTaskScheduler();
         if (scheduler) {
-          await scheduler.refreshUserToken(user);
-          // Refresh user data from Redis to get updated token
-          const updatedUserData = await redisClient.get(`user:${uid}`);
-          if (updatedUserData) {
-            const updatedUser = JSON.parse(updatedUserData);
-            user.token = updatedUser.token;
-          }
+          const updatedUserData = await scheduler.refreshUserToken(user);
+          user.token = updatedUserData.token;
         }
 
         // Retry the order history call
@@ -615,13 +601,8 @@ router.post('/users/:uid/tasks/:taskId/complete', async (req, res) => {
         // Refresh token from scheduler
         const scheduler = getTaskScheduler();
         if (scheduler) {
-          await scheduler.refreshUserToken(user);
-          // Refresh user data from Redis to get updated token
-          const updatedUserData = await redisClient.get(`user:${uid}`);
-          if (updatedUserData) {
-            const updatedUser = JSON.parse(updatedUserData);
-            user.token = updatedUser.token;
-          }
+          const updatedUserData = await scheduler.refreshUserToken(user);
+          user.token = updatedUserData.token;
         }
 
         // Retry the complete task call

@@ -20,7 +20,7 @@ class APIService {
 
     this.client = axios.create({
       baseURL: API_BASE_URL,
-      timeout: 10000,
+      timeout: 30000, // Increase timeout to 30 seconds
       httpsAgent: httpsAgent,
     });
   }
@@ -73,10 +73,33 @@ class APIService {
         logger.info(`[checklogin] Token received: ${response.data.body.token.substring(0, 50)}...`);
         return response.data.body;
       } else {
-        throw new Error(`API Error: ${response.data.ret.msg} (Code: ${response.data.ret.code})`);
+        const errorMsg = `API Error: ${response.data.ret.msg} (Code: ${response.data.ret.code})`;
+        logger.error(`[checklogin] ❌ ${errorMsg}`);
+        throw new Error(errorMsg);
       }
     } catch (error) {
-      logger.error('[checklogin] ❌ Error:', error.message);
+      // Log detailed error information
+      if (error.response) {
+        // API responded with error status
+        logger.error(`[checklogin] ❌ API Error:`, {
+          status: error.response.status,
+          statusText: error.response.statusText,
+          data: error.response.data,
+        });
+      } else if (error.request) {
+        // Request made but no response received (timeout/network error)
+        logger.error(`[checklogin] ❌ Network Error: No response received`, {
+          message: error.message,
+          code: error.code,
+          timeout: error.config?.timeout,
+        });
+      } else {
+        // Other errors
+        logger.error(`[checklogin] ❌ Error:`, {
+          message: error.message,
+          stack: error.stack?.split('\n').slice(0, 3).join('\n'),
+        });
+      }
       throw error;
     }
   }

@@ -49,14 +49,11 @@ export class TaskScheduler {
     }
 
     this.isRunning = true;
-    logger.info(`TaskScheduler started - Daily execution mode (8-9 AM ${this.timezone})`);
-    this.addSystemLog(`✅ 调度器已启动 - 每天北京时间 8-9 点随机执行 (Timezone: ${this.timezone})`, 'success');
+    logger.info(`TaskScheduler started - Dual execution mode (8-9 AM + 4h later, ${this.timezone})`);
+    this.addSystemLog(`✅ 调度器已启动 - 每天执行两次任务 (8-9点 + 4小时后) (Timezone: ${this.timezone})`, 'success');
 
     // Schedule daily task execution at random time between 8-9 AM
     this.scheduleDailyExecution();
-
-    // Keep-alive token refresh every 4 hours (non-intrusive)
-    this.scheduleTokenRefresh();
   }
 
   stop() {
@@ -71,7 +68,8 @@ export class TaskScheduler {
 
   /**
    * Schedule daily sign-in task execution
-   * Random time between 8-9 AM Beijing Time (Asia/Shanghai)
+   * First execution: Random time between 8-9 AM Beijing Time (Asia/Shanghai)
+   * Second execution: 4 hours after first execution completes
    */
   scheduleDailyExecution() {
     // CronJob: Run at 8 AM Beijing Time with random minute/second
@@ -89,37 +87,86 @@ export class TaskScheduler {
         const randomDelay = Math.floor(Math.random() * 60 * 60 * 1000); // 0-60 minutes in ms
         const randomMinutes = Math.floor(randomDelay / 60000);
 
-        logger.info(`Daily execution trigger at 8 AM ${this.timezone}, scheduling for +${randomMinutes} minutes`);
+        logger.info(`[First Execution] Trigger at 8 AM ${this.timezone}, scheduling for +${randomMinutes} minutes`);
 
         setTimeout(async () => {
           if (!this.isRunning) return;
 
           const users = await this.loadUsers();
-          logger.info(`[Daily Execution] Starting for ${users.length} users`);
-          this.addSystemLog(`📅 开始每日签到执行 (${users.length} 个账户) - Daily sign-in started`, 'info');
+          logger.info(`[First Execution] Starting for ${users.length} users`);
+          this.addSystemLog(`📅 第一次执行开始 (${users.length} 个账户) - First execution started`, 'info');
 
           for (const user of users) {
             if (user.isActive) {
               try {
-                await this.executeDailySignIn(user);
+                await this.executeDailySignIn(user, 1);
               } catch (error) {
-                logger.error(`[Daily] Error for user ${user.uid}:`, error.message);
+                logger.error(`[First Execution] Error for user ${user.uid}:`, error.message);
                 this.addSystemLog(
-                  `❌ 用户 ${user.uid} 执行失败: ${error.message}`,
+                  `❌ 用户 ${user.uid} 第一次执行失败: ${error.message}`,
                   'error'
                 );
               }
             }
           }
 
-          logger.info('[Daily Execution] Completed');
-          this.addSystemLog('✅ 每日签到执行完成 (Daily sign-in completed)', 'success');
+          logger.info('[First Execution] Completed');
+          this.addSystemLog('✅ 第一次执行完成 (First execution completed)', 'success');
+
+          // Schedule second execution 4 hours later
+          this.scheduleSecondExecution();
         }, randomDelay);
       }
     );
 
     this.jobs.set('dailyExecution', job);
-    logger.info(`Daily execution scheduled for 8 AM ${this.timezone} (random time between 8-9 AM)`);
+    logger.info(`First execution scheduled for 8 AM ${this.timezone} (random time between 8-9 AM)`);
+    logger.info(`Second execution will be scheduled 4 hours after first execution completes`);
+  }
+
+  /**
+   * Schedule second execution 4 hours after first execution
+   */
+  scheduleSecondExecution() {
+    const fourHoursLater = new Date(Date.now() + 4 * 60 * 60 * 1000);
+    logger.info(`[Second Execution] Scheduled for ${fourHoursLater.toLocaleString('zh-CN', { timeZone: this.timezone })}`);
+    this.addSystemLog(
+      `⏰ 第二次执行已安排在 4 小时后 (${fourHoursLater.toLocaleTimeString('zh-CN', { timeZone: this.timezone })})`,
+      'info'
+    );
+
+    const job = schedule.scheduleJob(fourHoursLater, async () => {
+      if (!this.isRunning) {
+        logger.info('[Second Execution] Scheduler not running, skipping');
+        return;
+      }
+
+      const users = await this.loadUsers();
+      logger.info(`[Second Execution] Starting for ${users.length} users`);
+      this.addSystemLog(`📅 第二次执行开始 (${users.length} 个账户) - Second execution started`, 'info');
+
+      for (const user of users) {
+        if (user.isActive) {
+          try {
+            await this.executeDailySignIn(user, 2);
+          } catch (error) {
+            logger.error(`[Second Execution] Error for user ${user.uid}:`, error.message);
+            this.addSystemLog(
+              `❌ 用户 ${user.uid} 第二次执行失败: ${error.message}`,
+              'error'
+            );
+          }
+        }
+      }
+
+      logger.info('[Second Execution] Completed');
+      this.addSystemLog('✅ 第二次执行完成 (Second execution completed)', 'success');
+
+      // Clean up this job
+      this.jobs.delete('secondExecution');
+    });
+
+    this.jobs.set('secondExecution', job);
   }
 
   /**
@@ -127,24 +174,27 @@ export class TaskScheduler {
    * 1. Fetch tasks once
    * 2. Process each task based on wait conditions
    * Auto-retry with token refresh on TOKEN_EXPIRED
+   * @param {Object} user - User configuration
+   * @param {number} executionNumber - 1 for first execution, 2 for second execution
    */
-  async executeDailySignIn(user) {
+  async executeDailySignIn(user, executionNumber = 1) {
     try {
-      logger.info(`[Daily] Executing daily sign-in for user ${user.uid}`);
+      const execLabel = executionNumber === 1 ? 'First' : 'Second';
+      logger.info(`[${execLabel}] Executing daily sign-in for user ${user.uid}`);
+
 
       // Get user data
       let userData = await this.getUserData(user.uid);
       if (!userData.token) {
-        logger.warn(`[Daily] No token available for user ${user.uid}, refreshing...`);
-        await this.refreshUserToken(user);
-        userData = await this.getUserData(user.uid);
+        logger.warn(`[${execLabel}] No token available for user ${user.uid}, refreshing...`);
+        userData = await this.refreshUserToken(user);
         if (!userData.token) {
           throw new Error('Failed to refresh token');
         }
       }
 
       // ===== FIRST API CALL: GET TASKS (Only once per day) =====
-      logger.info(`[Daily] Fetching tasks for user ${user.uid} (ONE TIME ONLY)`);
+      logger.info(`[${execLabel}] Fetching tasks for user ${user.uid} (ONE TIME ONLY)`);
       this.addSystemLog(`📥 正在获取任务... (Fetching tasks for UID: ${user.uid})`, 'info');
 
       let tasks;
@@ -161,14 +211,17 @@ export class TaskScheduler {
       } catch (error) {
         // If token expired, refresh and retry once
         if (error.message === 'TOKEN_EXPIRED') {
-          logger.warn(`[Daily] Token expired, refreshing and retrying...`);
+          logger.warn(`[${execLabel}] Token expired, refreshing and retrying...`);
           this.addSystemLog(
             `🔄 Token 已过期，正在刷新并重试 (Token expired, retrying)`,
             'warning'
           );
           
-          await this.refreshUserToken(user);
-          userData = await this.getUserData(user.uid);
+          // Refresh token and get updated userData
+          userData = await this.refreshUserToken(user);
+          
+          // Verify token was updated
+          logger.info(`[${execLabel}] Using refreshed token for retry: ${userData.token.substring(0, 50)}...`);
           
           tasks = await apiService.getActivityTasks(
             user.flowId,
@@ -184,7 +237,7 @@ export class TaskScheduler {
         }
       }
 
-      logger.info(`[Daily] Received ${tasks.length} tasks for user ${user.uid}`);
+      logger.info(`[${execLabel}] Received ${tasks.length} tasks for user ${user.uid}`);
       this.addSystemLog(
         `📋 获取到 ${tasks.length} 个任务 (Fetched ${tasks.length} tasks)`,
         'info'
@@ -207,7 +260,7 @@ export class TaskScheduler {
       // ===== CHECK AND PERFORM LOTTERY IF AVAILABLE =====
       // First, fetch fresh user info to check lottery_num
       try {
-        logger.info(`[Daily] Fetching user info to check lottery tickets for user ${user.uid}`);
+        logger.info(`[${execLabel}] Fetching user info to check lottery tickets for user ${user.uid}`);
         
         let userInfo;
         try {
@@ -222,9 +275,8 @@ export class TaskScheduler {
           );
         } catch (error) {
           if (error.message === 'TOKEN_EXPIRED') {
-            logger.warn(`[Daily] Token expired while fetching user info, refreshing...`);
-            await this.refreshUserToken(user);
-            userData = await this.getUserData(user.uid);
+            logger.warn(`[${execLabel}] Token expired while fetching user info, refreshing...`);
+            userData = await this.refreshUserToken(user);
             
             userInfo = await apiService.getUserInfo(
               user.flowId,
@@ -242,7 +294,7 @@ export class TaskScheduler {
 
         const lotteryNum = userInfo?.lottery_num || 0;
         if (lotteryNum > 0) {
-          logger.info(`[Daily] User ${user.uid} has ${lotteryNum} lottery tickets, performing ${lotteryNum} draws...`);
+          logger.info(`[${execLabel}] User ${user.uid} has ${lotteryNum} lottery tickets, performing ${lotteryNum} draws...`);
           this.addSystemLog(
             `🎰 用户 ${user.uid} 有 ${lotteryNum} 张盲盒券，开始抽奖... (Performing ${lotteryNum} draws)`,
             'info'
@@ -251,7 +303,7 @@ export class TaskScheduler {
           // Draw lottery for each ticket
           for (let i = 0; i < lotteryNum; i++) {
             try {
-              logger.info(`[Daily] Drawing lottery ${i + 1}/${lotteryNum} for user ${user.uid}...`);
+              logger.info(`[${execLabel}] Drawing lottery ${i + 1}/${lotteryNum} for user ${user.uid}...`);
               this.addSystemLog(
                 `🎰 正在抽奖 ${i + 1}/${lotteryNum}... (Draw ${i + 1}/${lotteryNum})`,
                 'info'
@@ -269,7 +321,7 @@ export class TaskScheduler {
 
               if (drawResult) {
                 const prize = drawResult.prize || {};
-                logger.info(`[Daily] ✅ Draw ${i + 1} successful, prize: ${prize.prize_name}`);
+                logger.info(`[${execLabel}] ✅ Draw ${i + 1} successful, prize: ${prize.prize_name}`);
                 this.addSystemLog(
                   `🎁 第 ${i + 1} 次抽奖成功！获得: ${prize.prize_name} (${prize.prize_desc})`,
                   'success'
@@ -277,14 +329,14 @@ export class TaskScheduler {
               }
             } catch (error) {
               if (error.message === 'TOKEN_EXPIRED') {
-                logger.warn(`[Daily] Token expired during draw ${i + 1}, will retry remaining draws next time`);
+                logger.warn(`[${execLabel}] Token expired during draw ${i + 1}, will retry remaining draws next time`);
                 this.addSystemLog(
                   `⚠️ 第 ${i + 1} 次抽奖时 Token 过期，剩余抽奖将在下次重试 (Remaining draws will retry later)`,
                   'warning'
                 );
                 break; // Stop remaining draws if token expires
               } else {
-                logger.error(`[Daily] Draw ${i + 1} failed for user ${user.uid}:`, error.message);
+                logger.error(`[${execLabel}] Draw ${i + 1} failed for user ${user.uid}:`, error.message);
                 this.addSystemLog(
                   `❌ 第 ${i + 1} 次抽奖失败: ${error.message}`,
                   'error'
@@ -294,10 +346,10 @@ export class TaskScheduler {
             }
           }
         } else {
-          logger.info(`[Daily] User ${user.uid} has no lottery tickets`);
+          logger.info(`[${execLabel}] User ${user.uid} has no lottery tickets`);
         }
       } catch (error) {
-        logger.error(`[Daily] Failed to fetch user info for lottery check:`, error.message);
+        logger.error(`[${execLabel}] Failed to fetch user info for lottery check:`, error.message);
       }
 
       // ===== PROCESS EACH TASK =====
@@ -306,7 +358,7 @@ export class TaskScheduler {
         await this.processDailyTask(user, userData, task);
       }
 
-      logger.info(`[Daily] Completed processing for user ${user.uid}, refreshing user info and tasks...`);
+      logger.info(`[${execLabel}] Completed processing for user ${user.uid}, refreshing user info and tasks...`);
       this.addSystemLog(
         `🔄 任务处理完成，正在刷新用户信息和任务列表... (Refreshing user info and tasks)`,
         'info'
@@ -328,9 +380,8 @@ export class TaskScheduler {
           );
         } catch (error) {
           if (error.message === 'TOKEN_EXPIRED') {
-            logger.warn(`[Daily] Token expired while refreshing user info, refreshing token...`);
-            await this.refreshUserToken(user);
-            userData = await this.getUserData(user.uid);
+            logger.warn(`[${execLabel}] Token expired while refreshing user info, refreshing token...`);
+            userData = await this.refreshUserToken(user);
             
             userInfoAfter = await apiService.getUserInfo(
               user.flowId,
@@ -360,9 +411,8 @@ export class TaskScheduler {
           );
         } catch (error) {
           if (error.message === 'TOKEN_EXPIRED') {
-            logger.warn(`[Daily] Token expired while refreshing tasks, refreshing token...`);
-            await this.refreshUserToken(user);
-            userData = await this.getUserData(user.uid);
+            logger.warn(`[${execLabel}] Token expired while refreshing tasks, refreshing token...`);
+            userData = await this.refreshUserToken(user);
             
             tasksAfter = await apiService.getActivityTasks(
               user.flowId,
@@ -400,13 +450,13 @@ export class TaskScheduler {
           timestamp: new Date().toISOString(),
         });
 
-        logger.info(`[Daily] ✅ Successfully refreshed user info and tasks for user ${user.uid}`);
+        logger.info(`[${execLabel}] ✅ Successfully refreshed user info and tasks for user ${user.uid}`);
         this.addSystemLog(
           `✅ 用户信息和任务列表已刷新 (User info and tasks refreshed) - UID: ${user.uid}`,
           'success'
         );
       } catch (error) {
-        logger.warn(`[Daily] Failed to refresh user info/tasks after completion:`, error.message);
+        logger.warn(`[${execLabel}] Failed to refresh user info/tasks after completion:`, error.message);
         this.addSystemLog(
           `⚠️ 刷新用户信息失败，但任务已完成 (Refresh failed but tasks completed): ${error.message}`,
           'warning'
@@ -414,14 +464,21 @@ export class TaskScheduler {
       }
     } catch (error) {
       if (error.message === 'TOKEN_EXPIRED') {
-        logger.info(`[Daily] Token expired for user ${user.uid}, will retry on next daily run`);
+        logger.info(`[${execLabel}] Token expired for user ${user.uid}, will retry on next daily run`);
         this.addSystemLog(
           `⚠️ Token 已过期 (Token expired for UID: ${user.uid})`,
           'warning'
         );
       } else {
-        logger.error(`[Daily] Failed to execute daily sign-in for user ${user.uid}:`, error.message);
-        throw error;
+        logger.error(`[${execLabel}] Failed to execute daily sign-in for user ${user.uid}:`, {
+          message: error.message,
+          code: error.code,
+          stack: error.stack?.split('\n').slice(0, 5).join('\n'),
+        });
+        this.addSystemLog(
+          `❌ 每日签到失败 (Daily sign-in failed for UID: ${user.uid}): ${error.message}`,
+          'error'
+        );
       }
     }
   }
@@ -542,8 +599,7 @@ export class TaskScheduler {
             'warning'
           );
           
-          await this.refreshUserToken(user);
-          const updatedData = await this.getUserData(user.uid);
+          const updatedData = await this.refreshUserToken(user);
           
           result = await apiService.completeTask(
             user.flowId,
@@ -596,63 +652,70 @@ export class TaskScheduler {
 
   /**
    * Non-intrusive token refresh (every 4 hours)
-   * Just to keep token fresh, not for frequent checks
-   * Uses the same timezone as daily execution
-   */
-  scheduleTokenRefresh() {
-    const job = schedule.scheduleJob(
-      { hour: [0, 4, 8, 12, 16, 20], minute: 0, tz: this.timezone },
-      async () => {
-        if (!this.isRunning) return;
-
-        logger.info('[Token] Non-intrusive token refresh (every 4 hours)');
-        const users = await this.loadUsers();
-
-        for (const user of users) {
-          if (user.isActive) {
-            try {
-              await this.refreshUserToken(user);
-            } catch (error) {
-              logger.warn(`[Token] Failed to refresh token for user ${user.uid}:`, error.message);
-            }
-          }
-        }
-      }
-    );
-
-    this.jobs.set('tokenRefresh', job);
-    logger.info(`Token refresh scheduled every 4 hours (${this.timezone})`);
-  }
-
   /**
    * Refresh user token
+   * Always saves updated token back to Redis
+   * Includes retry mechanism for network failures
    */
-  async refreshUserToken(user) {
-    try {
-      logger.info(`[Token] Refreshing token for user ${user.uid}`);
+  async refreshUserToken(user, retries = 3) {
+    let lastError;
+    
+    for (let attempt = 1; attempt <= retries; attempt++) {
+      try {
+        logger.info(`[Token] Refreshing token for user ${user.uid} (attempt ${attempt}/${retries})`);
 
-      const userData = await this.getUserData(user.uid);
-      const currentToken = userData?.token;
+        // Get latest user data from Redis
+        let userData = await this.getUserData(user.uid);
+        
+        // If no userData exists in Redis, create initial structure
+        if (!userData || Object.keys(userData).length === 0) {
+          userData = {
+            uid: user.uid,
+            uuid: user.uuid,
+            flowId: user.flowId,
+            accessKey: user.accessKey,
+            machineId: user.machineId || '830504a3-d020-43af-b3e6-4c8690f5d6be',
+            platform: user.platform || 'mac',
+            phone: user.phone,
+          };
+        }
 
-      const loginResult = await apiService.checkLogin(
-        user.uid,
-        user.platform || 'mac',
-        user.accessKey,
-        user.machineId,
-        currentToken
-      );
+        const currentToken = userData?.token;
 
-      userData.token = loginResult.token;
-      userData.accessKey = loginResult.access_key || user.accessKey;
-      userData.tokenUpdatedAt = new Date().toISOString();
+        const loginResult = await apiService.checkLogin(
+          user.uid,
+          user.platform || 'mac',
+          user.accessKey,
+          user.machineId || '830504a3-d020-43af-b3e6-4c8690f5d6be',
+          currentToken
+        );
 
-      await redisClient.set(`user:${user.uid}`, JSON.stringify(userData));
+        // Update token and save to Redis
+        userData.token = loginResult.token;
+        userData.accessKey = loginResult.access_key || user.accessKey;
+        userData.tokenUpdatedAt = new Date().toISOString();
 
-      logger.info(`[Token] Token refreshed for user ${user.uid}`);
-    } catch (error) {
-      logger.error(`[Token] Failed to refresh token for user ${user.uid}:`, error.message);
-      throw error;
+        await redisClient.set(`user:${user.uid}`, JSON.stringify(userData));
+
+        logger.info(`[Token] Token refreshed and saved to Redis for user ${user.uid}`);
+        
+        return userData; // Return updated userData
+      } catch (error) {
+        lastError = error;
+        logger.error(`[Token] Attempt ${attempt}/${retries} failed for user ${user.uid}:`, error.message);
+        
+        // If this is not the last attempt, wait before retrying
+        if (attempt < retries) {
+          const waitTime = attempt * 2000; // Progressive delay: 2s, 4s, 6s
+          logger.info(`[Token] Waiting ${waitTime}ms before retry...`);
+          await new Promise(resolve => setTimeout(resolve, waitTime));
+        }
+      }
     }
+    
+    // All retries failed
+    logger.error(`[Token] All ${retries} attempts failed for user ${user.uid}`);
+    throw lastError;
   }
 
   async getUserData(uid) {
