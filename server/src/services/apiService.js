@@ -32,8 +32,8 @@ class APIService {
     return {
       'Host': 'h5-proxy.fdcompute.com',
       'Content-Type': 'application/json',
-      'user-agent': 'Dart/3.3 (dart:io)',
-      'version': '1.5.0',
+      'user-agent': 'Dart/3.5 (dart:io)',
+      'version': '1.10.1',
       'accept-encoding': 'gzip',
       'machineid': options.machineId || '830504a3-d020-43af-b3e6-4c8690f5d6be',
       'accesskey': options.accessKey || '90f8699a-e0d9-4ed2-8796-4ad2af58c27c',
@@ -54,7 +54,7 @@ class APIService {
   async checkLogin(uid, platform = 'mac', accessKey = '90f8699a-e0d9-4ed2-8796-4ad2af58c27c', machineId = '830504a3-d020-43af-b3e6-4c8690f5d6be', token = null) {
     try {
       logger.info(`[checklogin] Attempting login for uid: ${uid}`);
-      
+
       const response = await this.client.post(
         '/v1/nika/client/checklogin',
         { uid },
@@ -110,7 +110,7 @@ class APIService {
   async getUserInfo(flowId, uuid, uid, token, accessKey, machineId, platform = 'mac') {
     try {
       logger.info(`[getuserinfo] Fetching user info for uid: ${uid}`);
-      
+
       const response = await this.client.post(
         '/v1/nika/client/getuserinfo',
         {
@@ -153,7 +153,7 @@ class APIService {
   async getActivityTasks(flowId, uid, uuid, accessKey, token, machineId, platform = 'mac') {
     try {
       logger.info(`[getactivitytask] Fetching tasks for uid: ${uid}`);
-      
+
       const response = await this.client.post(
         '/v1/nika/client/getactivitytask',
         {
@@ -193,7 +193,7 @@ class APIService {
   async completeTask(flowId, uid, uuid, accessKey, taskId, token, machineId, platform = 'mac') {
     try {
       logger.info(`[completetask] Attempting to complete task ${taskId} for uid: ${uid}`);
-      
+
       const response = await this.client.post(
         '/v1/nika/client/completetask',
         {
@@ -235,7 +235,7 @@ class APIService {
   async drawPrize(flowId, uid, uuid, accessKey, token, machineId, platform = 'mac') {
     try {
       logger.info(`[drawprize] Attempting to draw prize for uid: ${uid}`);
-      
+
       const response = await this.client.post(
         '/v1/nika/client/drawprize',
         {

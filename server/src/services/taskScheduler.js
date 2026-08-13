@@ -6,7 +6,7 @@ import { broadcastToClients } from '../index.js';
 
 /**
  * 每天一次的签到任务调度器
- * 每天北京时间 8-9 点的随机时间触发（Asia/Shanghai 时区）
+ * 每天北京时间 10-11 点的随机时间触发（Asia/Shanghai 时区）
  * 1. 获取一次任务列表
  * 2. 按照任务条件（如 90 分钟等待）执行完成
  * 不频繁请求上游接口
@@ -17,6 +17,10 @@ export class TaskScheduler {
     this.isRunning = false;
     // 使用北京时区（Asia/Shanghai, UTC+8）
     this.timezone = process.env.SCHEDULER_TIMEZONE || 'Asia/Shanghai';
+    this.workerInterval = null;
+    this.checkIntervalMs = parseInt(process.env.TASK_CHECK_INTERVAL, 10) || 30000;
+    this.heartbeatStartHour = parseInt(process.env.HEARTBEAT_START_HOUR, 10) || 10;
+    this.heartbeatEndHour = parseInt(process.env.HEARTBEAT_END_HOUR, 10) || 22;
   }
 
   async initialize() {
@@ -49,11 +53,14 @@ export class TaskScheduler {
     }
 
     this.isRunning = true;
-    logger.info(`TaskScheduler started - Dual execution mode (8-9 AM + 4h later, ${this.timezone})`);
-    this.addSystemLog(`✅ 调度器已启动 - 每天执行两次任务 (8-9点 + 4小时后) (Timezone: ${this.timezone})`, 'success');
+    logger.info(`TaskScheduler started - Minute heartbeat & Dual execution mode (${this.timezone})`);
+    this.addSystemLog(`✅ 调度器已启动 - 每日 10:00 (上午10点) 自动签到抽奖与 10:00-22:00 心跳推进已就绪 (Timezone: ${this.timezone})`, 'success');
 
-    // Schedule daily task execution at random time between 8-9 AM
+    // Schedule daily task execution at random time between 10-11 AM
     this.scheduleDailyExecution();
+
+    // Start minute heartbeat worker for active users
+    this.startHeartbeatWorker();
   }
 
   stop() {
@@ -62,32 +69,298 @@ export class TaskScheduler {
       job.cancel();
     });
     this.jobs.clear();
+
+    if (this.workerInterval) {
+      clearInterval(this.workerInterval);
+      this.workerInterval = null;
+    }
+
     logger.info('TaskScheduler stopped');
     this.addSystemLog('⏹️ 调度器已停止 (Scheduler stopped)', 'warning');
   }
 
   /**
+   * Start 1-minute recurring heartbeat worker loop for Type 2 time-consuming tasks
+   */
+  startHeartbeatWorker() {
+    if (this.workerInterval) {
+      clearInterval(this.workerInterval);
+    }
+
+    logger.info(`[Heartbeat Worker] Started with interval ${this.checkIntervalMs / 1000}s`);
+
+    // Run first heartbeat check after 3 seconds
+    setTimeout(() => {
+      if (this.isRunning) {
+        this.processHeartbeatForActiveUsers().catch(err => {
+          logger.error('[Heartbeat Worker] Initial run error:', err.message);
+        });
+      }
+    }, 3000);
+
+    // Recurring interval loop
+    this.workerInterval = setInterval(async () => {
+      if (!this.isRunning) return;
+      await this.processHeartbeatForActiveUsers();
+    }, this.checkIntervalMs);
+  }
+
+  /**
+   * Check if current time is within active heartbeat hours (10:00 - 22:00 Beijing Time)
+   */
+  isWithinHeartbeatHours() {
+    try {
+      const hourStr = new Intl.DateTimeFormat('en-US', {
+        timeZone: this.timezone,
+        hour: 'numeric',
+        hour12: false,
+      }).format(new Date());
+      let currentHour = parseInt(hourStr, 10);
+      if (currentHour === 24) currentHour = 0;
+      return currentHour >= this.heartbeatStartHour && currentHour < this.heartbeatEndHour;
+    } catch (error) {
+      logger.error('[Heartbeat] Error checking time window:', error.message);
+      return false;
+    }
+  }
+
+  /**
+   * Run heartbeat task pulse for all active users
+   */
+  async processHeartbeatForActiveUsers() {
+    try {
+      if (!this.isWithinHeartbeatHours()) {
+        logger.debug(`[Heartbeat] Outside active window (${this.heartbeatStartHour}:00 - ${this.heartbeatEndHour}:00 ${this.timezone}), skipping pulse check`);
+        return;
+      }
+
+      const users = await this.loadUsers();
+      const activeUsers = users.filter((u) => u.isActive);
+      if (activeUsers.length === 0) return;
+
+      logger.info(`[Heartbeat] Running task pulse check for ${activeUsers.length} active user(s)`);
+
+      for (const user of activeUsers) {
+        try {
+          await this.pulseUserTasks(user);
+        } catch (error) {
+          logger.error(`[Heartbeat] Pulse failed for user ${user.uid}:`, error.message);
+        }
+      }
+    } catch (error) {
+      logger.error('[Heartbeat] Error during periodic heartbeat loop:', error.message);
+    }
+  }
+
+  /**
+   * Pulse user tasks:
+   * 1. Completes any Type 1 (sign-in) tasks immediately.
+   * 2. If active incomplete Type 2 (time-consuming) tasks exist:
+   *    Sends a completetask pulse to increment FuFuHub play time.
+   * 3. Refreshes user info & task list from API, saves to Redis, and broadcasts WebSocket.
+   * 4. Claims rewards automatically if progress reaches 100%.
+   */
+  async pulseUserTasks(user) {
+    try {
+      let userData = await this.getUserData(user.uid);
+      if (!userData.token) {
+        userData = await this.refreshUserToken(user);
+      }
+
+      // Fetch latest tasks
+      let tasks;
+      try {
+        tasks = await apiService.getActivityTasks(
+          user.flowId,
+          user.uid,
+          user.uuid,
+          user.accessKey,
+          userData.token,
+          user.machineId,
+          user.platform || 'mac'
+        );
+      } catch (error) {
+        if (error.message === 'TOKEN_EXPIRED') {
+          userData = await this.refreshUserToken(user);
+          tasks = await apiService.getActivityTasks(
+            user.flowId,
+            user.uid,
+            user.uuid,
+            user.accessKey,
+            userData.token,
+            user.machineId,
+            user.platform || 'mac'
+          );
+        } else {
+          throw error;
+        }
+      }
+
+      // Save latest tasks to Redis
+      await redisClient.set(`tasks:${user.uid}`, JSON.stringify(tasks));
+
+      // 1. Process Type 1 tasks (sign-in)
+      const type1Tasks = tasks.filter((t) => t.task_type === 1);
+      for (const task of type1Tasks) {
+        await this.completeTaskCall(user, userData, task);
+      }
+
+      // 2. Process Type 2 & Type 3 tasks (time-consuming & 30s pulse tasks)
+      const incompletePulseTasks = tasks.filter(
+        (t) => (t.task_type === 2 || t.task_type === 3) && (t.task_value || 0) < (t.task_target || 0)
+      );
+
+      const completedPulseTasks = tasks.filter(
+        (t) => (t.task_type === 2 || t.task_type === 3) && (t.task_target || 0) > 0 && (t.task_value || 0) >= (t.task_target || 0)
+      );
+
+      // Claim rewards for tasks that reached 100%
+      for (const task of completedPulseTasks) {
+        const completionKey = `task:${user.uid}:${task.task_id}:completed`;
+        const alreadyDone = await redisClient.get(completionKey);
+        if (!alreadyDone) {
+          logger.info(`[Pulse] Claiming completed Task ${task.task_id} (${task.task_name}) Type: ${task.task_type}`);
+          await this.completeTaskCall(user, userData, task);
+        }
+      }
+
+      // Pulse incomplete Type 2 & Type 3 tasks based on individual interval requirement:
+      // Type 3: 30 seconds interval (30,000 ms)
+      // Type 2: 60 seconds interval (60,000 ms - 拟真1分钟一次)
+      let pulsedAnyTask = false;
+
+      if (incompletePulseTasks.length > 0) {
+        for (const targetTask of incompletePulseTasks) {
+          const lastPulseKey = `task:${user.uid}:${targetTask.task_id}:lastPulse`;
+          const lastPulseStr = await redisClient.get(lastPulseKey);
+          const lastPulseTime = lastPulseStr ? parseInt(lastPulseStr, 10) : 0;
+          const now = Date.now();
+
+          // Type 3 requires 30s, Type 2 requires 60s (1 min)
+          const requiredIntervalMs = targetTask.task_type === 3 ? 30000 : 60000;
+
+          if (now - lastPulseTime < requiredIntervalMs - 2000) {
+            const elapsedSec = Math.round((now - lastPulseTime) / 1000);
+            logger.info(
+              `[Pulse] Skipping task ${targetTask.task_id} (${targetTask.task_name}, Type ${targetTask.task_type}) - last pulse was ${elapsedSec}s ago (required: ${requiredIntervalMs / 1000}s)`
+            );
+            continue;
+          }
+
+          pulsedAnyTask = true;
+          const progress = targetTask.task_value || 0;
+          const target = targetTask.task_target || 0;
+          const intervalLabel = targetTask.task_type === 3 ? '30秒' : '1分钟';
+
+          logger.info(
+            `[Pulse] Sending pulse for user ${user.uid}, Task ${targetTask.task_id} (${targetTask.task_name}) Type: ${targetTask.task_type} (${progress}/${target}) Interval: ${intervalLabel}`
+          );
+          this.addSystemLog(
+            `💓 正在为用户 ${user.uid} 发送心跳脉冲 (任务: ${targetTask.task_name}, Type ${targetTask.task_type}, 频率: ${intervalLabel}, 当前进度: ${progress}/${target})`,
+            'info'
+          );
+
+          // Send completetask pulse
+          try {
+            await apiService.completeTask(
+              user.flowId,
+              user.uid,
+              user.uuid,
+              user.accessKey,
+              targetTask.task_id,
+              userData.token,
+              user.machineId,
+              user.platform || 'mac'
+            );
+            await redisClient.set(lastPulseKey, now.toString());
+          } catch (pulseErr) {
+            if (pulseErr.message === 'TOKEN_EXPIRED') {
+              userData = await this.refreshUserToken(user);
+              await apiService.completeTask(
+                user.flowId,
+                user.uid,
+                user.uuid,
+                user.accessKey,
+                targetTask.task_id,
+                userData.token,
+                user.machineId,
+                user.platform || 'mac'
+              );
+              await redisClient.set(lastPulseKey, now.toString());
+            } else {
+              logger.warn(`[Pulse] Pulse call note for task ${targetTask.task_id}: ${pulseErr.message}`);
+            }
+          }
+        }
+
+        // Fetch refreshed user info & tasks from API
+        const updatedTasks = await apiService.getActivityTasks(
+          user.flowId,
+          user.uid,
+          user.uuid,
+          user.accessKey,
+          userData.token,
+          user.machineId,
+          user.platform || 'mac'
+        );
+
+        const updatedUserInfo = await apiService.getUserInfo(
+          user.flowId,
+          user.uuid,
+          user.uid,
+          userData.token,
+          user.accessKey,
+          user.machineId,
+          user.platform || 'mac'
+        );
+
+        // Save to Redis
+        await redisClient.set(`tasks:${user.uid}`, JSON.stringify(updatedTasks));
+        await redisClient.set(`tasks:${user.uid}:fetchedAt`, new Date().toISOString());
+
+        // Broadcast to WebSocket clients
+        broadcastToClients({
+          type: 'tasksUpdated',
+          uid: user.uid,
+          tasks: updatedTasks,
+          timestamp: new Date().toISOString(),
+        });
+
+        broadcastToClients({
+          type: 'userInfoUpdated',
+          uid: user.uid,
+          userInfo: updatedUserInfo,
+          timestamp: new Date().toISOString(),
+        });
+
+        logger.info(`[Pulse] ✅ Task progress pulse completed & broadcasted for user ${user.uid}`);
+      }
+    } catch (error) {
+      logger.error(`[Pulse] Error pulsing tasks for user ${user.uid}:`, error.message);
+    }
+  }
+
+  /**
    * Schedule daily sign-in task execution
-   * First execution: Random time between 8-9 AM Beijing Time (Asia/Shanghai)
+   * First execution: Random time between 10:00 AM - 11:00 AM (10:00-11:00) Beijing Time (Asia/Shanghai)
    * Second execution: 4 hours after first execution completes
    */
   scheduleDailyExecution() {
-    // CronJob: Run at 8 AM Beijing Time with random minute/second
-    // 0 8 * * * = Every day at 8:00 AM in specified timezone
-    // Add timezone option to ensure Beijing time regardless of server location
+    // CronJob: Run at 10:00 AM (10:00) Beijing Time with random minute/second
+    // 0 10 * * * = Every day at 10:00 (10:00 AM) in specified timezone
     const job = schedule.scheduleJob(
-      { hour: 8, minute: 0, tz: this.timezone },
+      { hour: 10, minute: 0, tz: this.timezone },
       async () => {
         if (!this.isRunning) {
           logger.info('Scheduler not running, skipping daily execution');
           return;
         }
 
-        // Add random delay (0-60 minutes) to spread execution between 8-9 AM
+        // Add random delay (0-60 minutes) to spread execution between 10:00-11:00
         const randomDelay = Math.floor(Math.random() * 60 * 60 * 1000); // 0-60 minutes in ms
         const randomMinutes = Math.floor(randomDelay / 60000);
 
-        logger.info(`[First Execution] Trigger at 8 AM ${this.timezone}, scheduling for +${randomMinutes} minutes`);
+        logger.info(`[First Execution] Trigger at 10:00 AM (10:00) ${this.timezone}, scheduling for +${randomMinutes} minutes`);
 
         setTimeout(async () => {
           if (!this.isRunning) return;
@@ -120,7 +393,7 @@ export class TaskScheduler {
     );
 
     this.jobs.set('dailyExecution', job);
-    logger.info(`First execution scheduled for 8 AM ${this.timezone} (random time between 8-9 AM)`);
+    logger.info(`First execution scheduled for 10:00 AM (10:00) ${this.timezone} (random time between 10:00-11:00)`);
     logger.info(`Second execution will be scheduled 4 hours after first execution completes`);
   }
 
@@ -216,13 +489,13 @@ export class TaskScheduler {
             `🔄 Token 已过期，正在刷新并重试 (Token expired, retrying)`,
             'warning'
           );
-          
+
           // Refresh token and get updated userData
           userData = await this.refreshUserToken(user);
-          
+
           // Verify token was updated
           logger.info(`[${execLabel}] Using refreshed token for retry: ${userData.token.substring(0, 50)}...`);
-          
+
           tasks = await apiService.getActivityTasks(
             user.flowId,
             user.uid,
@@ -261,7 +534,7 @@ export class TaskScheduler {
       // First, fetch fresh user info to check lottery_num
       try {
         logger.info(`[${execLabel}] Fetching user info to check lottery tickets for user ${user.uid}`);
-        
+
         let userInfo;
         try {
           userInfo = await apiService.getUserInfo(
@@ -277,7 +550,7 @@ export class TaskScheduler {
           if (error.message === 'TOKEN_EXPIRED') {
             logger.warn(`[${execLabel}] Token expired while fetching user info, refreshing...`);
             userData = await this.refreshUserToken(user);
-            
+
             userInfo = await apiService.getUserInfo(
               user.flowId,
               user.uuid,
@@ -292,7 +565,9 @@ export class TaskScheduler {
           }
         }
 
-        const lotteryNum = userInfo?.lottery_num || 0;
+        // const lotteryNum = userInfo?.lottery_num || 0;
+        // TODO: The lottery draw is temporarily disabled
+        const lotteryNum = 0;
         if (lotteryNum > 0) {
           logger.info(`[${execLabel}] User ${user.uid} has ${lotteryNum} lottery tickets, performing ${lotteryNum} draws...`);
           this.addSystemLog(
@@ -352,11 +627,13 @@ export class TaskScheduler {
         logger.error(`[${execLabel}] Failed to fetch user info for lottery check:`, error.message);
       }
 
-      // ===== PROCESS EACH TASK =====
-      // Check each task and handle wait conditions
+      // ===== PROCESS EACH TASK & PULSE DURATION =====
       for (const task of tasks) {
         await this.processDailyTask(user, userData, task);
       }
+
+      // Execute immediate heartbeat pulse to advance time-consuming tasks
+      await this.pulseUserTasks(user);
 
       logger.info(`[${execLabel}] Completed processing for user ${user.uid}, refreshing user info and tasks...`);
       this.addSystemLog(
@@ -382,7 +659,7 @@ export class TaskScheduler {
           if (error.message === 'TOKEN_EXPIRED') {
             logger.warn(`[${execLabel}] Token expired while refreshing user info, refreshing token...`);
             userData = await this.refreshUserToken(user);
-            
+
             userInfoAfter = await apiService.getUserInfo(
               user.flowId,
               user.uuid,
@@ -413,7 +690,7 @@ export class TaskScheduler {
           if (error.message === 'TOKEN_EXPIRED') {
             logger.warn(`[${execLabel}] Token expired while refreshing tasks, refreshing token...`);
             userData = await this.refreshUserToken(user);
-            
+
             tasksAfter = await apiService.getActivityTasks(
               user.flowId,
               user.uid,
@@ -497,13 +774,48 @@ export class TaskScheduler {
 
       const taskType = task.task_type;
 
-      // Type 3: Ignore
+      // Type 3: 30-second pulse tasks
       if (taskType === 3) {
-        logger.info(`[Task] Task ${task.task_id} is Type 3, ignoring`);
-        this.addSystemLog(
-          `⏭️ 任务 ${task.task_id} (Type 3) 已跳过 (Task Type 3 skipped)`,
-          'info'
+        const progress = task.task_value || 0;
+        const target = task.task_target || 0;
+
+        logger.info(
+          `[Task] Task ${task.task_id} is Type 3 (30s pulse), Progress: ${progress}/${target}`
         );
+
+        if (target > 0 && progress >= target) {
+          logger.info(
+            `[Task] Task ${task.task_id} progress complete (${progress}/${target}), executing completion`
+          );
+          this.addSystemLog(
+            `✅ 任务 ${task.task_id} (Type 3) 进度已完成 ${progress}/${target}，开始完成任务`,
+            'success'
+          );
+          await this.completeTaskCall(user, userData, task);
+        } else {
+          logger.info(
+            `[Task] Task ${task.task_id} is Type 3, sending initial pulse (repeats every 30s during heartbeat)`
+          );
+          this.addSystemLog(
+            `💓 任务 ${task.task_id} (Type 3) 发送推进脉冲 (当前进度: ${progress}/${target}, 半分钟一次心跳)`,
+            'info'
+          );
+          try {
+            await apiService.completeTask(
+              user.flowId,
+              user.uid,
+              user.uuid,
+              user.accessKey,
+              task.task_id,
+              userData.token,
+              user.machineId,
+              user.platform || 'mac'
+            );
+            await redisClient.set(`task:${user.uid}:${task.task_id}:lastPulse`, Date.now().toString());
+          } catch (pulseErr) {
+            logger.warn(`[Task] Type 3 initial pulse call note for task ${task.task_id}: ${pulseErr.message}`);
+          }
+        }
         return;
       }
 
@@ -522,7 +834,7 @@ export class TaskScheduler {
       if (taskType === 2) {
         const progress = task.task_value || 0;
         const target = task.task_target || 0;
-        
+
         logger.info(
           `[Task] Task ${task.task_id} is Type 2 (time-consuming), Progress: ${progress}/${target}`
         );
@@ -598,9 +910,9 @@ export class TaskScheduler {
             `🔄 Token 已过期，正在刷新并重试完成任务 (Token expired, retrying task completion)`,
             'warning'
           );
-          
+
           const updatedData = await this.refreshUserToken(user);
-          
+
           result = await apiService.completeTask(
             user.flowId,
             user.uid,
@@ -659,14 +971,14 @@ export class TaskScheduler {
    */
   async refreshUserToken(user, retries = 3) {
     let lastError;
-    
+
     for (let attempt = 1; attempt <= retries; attempt++) {
       try {
         logger.info(`[Token] Refreshing token for user ${user.uid} (attempt ${attempt}/${retries})`);
 
         // Get latest user data from Redis
         let userData = await this.getUserData(user.uid);
-        
+
         // If no userData exists in Redis, create initial structure
         if (!userData || Object.keys(userData).length === 0) {
           userData = {
@@ -698,12 +1010,12 @@ export class TaskScheduler {
         await redisClient.set(`user:${user.uid}`, JSON.stringify(userData));
 
         logger.info(`[Token] Token refreshed and saved to Redis for user ${user.uid}`);
-        
+
         return userData; // Return updated userData
       } catch (error) {
         lastError = error;
         logger.error(`[Token] Attempt ${attempt}/${retries} failed for user ${user.uid}:`, error.message);
-        
+
         // If this is not the last attempt, wait before retrying
         if (attempt < retries) {
           const waitTime = attempt * 2000; // Progressive delay: 2s, 4s, 6s
@@ -712,7 +1024,7 @@ export class TaskScheduler {
         }
       }
     }
-    
+
     // All retries failed
     logger.error(`[Token] All ${retries} attempts failed for user ${user.uid}`);
     throw lastError;
