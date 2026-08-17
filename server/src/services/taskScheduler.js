@@ -443,6 +443,161 @@ export class TaskScheduler {
   }
 
   /**
+   * Execute checkin for a user based on checkin list and date logic
+   * @param {Object} user - User config
+   * @param {Object} userData - User session data with token
+   * @returns {Promise<Object>} Checkin result
+   */
+  async executeCheckin(user, userData) {
+    try {
+      logger.info(`[Checkin] Fetching checkin list for user ${user.uid}...`);
+      this.addSystemLog(`📅 正在获取签到任务列表 (UID: ${user.uid})...`, 'info');
+
+      let checkinData;
+      try {
+        checkinData = await apiService.getCheckinList(
+          user.uid,
+          userData.token,
+          user.accessKey,
+          user.machineId,
+          user.platform || 'mac'
+        );
+      } catch (error) {
+        if (error.message === 'TOKEN_EXPIRED') {
+          logger.warn(`[Checkin] Token expired for user ${user.uid}, refreshing token...`);
+          userData = await this.refreshUserToken(user);
+          checkinData = await apiService.getCheckinList(
+            user.uid,
+            userData.token,
+            user.accessKey,
+            user.machineId,
+            user.platform || 'mac'
+          );
+        } else {
+          throw error;
+        }
+      }
+
+      const checkinList = checkinData?.checkin_list || [];
+      const checkinCount = checkinData?.checkin_count || 0;
+
+      // Save checkin list to Redis
+      await redisClient.set(`checkin:${user.uid}`, JSON.stringify(checkinData));
+
+      // Filter items with non-empty date string
+      const checkedInItems = checkinList.filter((item) => item.date && item.date.trim() !== '');
+
+      // Get current date string in timezone (YYYY-MM-DD)
+      const getTodayDateStr = () => {
+        const formatter = new Intl.DateTimeFormat('en-CA', {
+          timeZone: this.timezone,
+          year: 'numeric',
+          month: '2-digit',
+          day: '2-digit',
+        });
+        return formatter.format(new Date());
+      };
+
+      const todayStr = getTodayDateStr();
+
+      // Check the latest checked in date
+      let latestCheckinDateStr = null;
+      if (checkedInItems.length > 0) {
+        const lastCheckedIn = checkedInItems[checkedInItems.length - 1];
+        if (lastCheckedIn.date) {
+          latestCheckinDateStr = lastCheckedIn.date.trim().split(' ')[0];
+        }
+      }
+
+      logger.info(`[Checkin] User ${user.uid} - Today: ${todayStr}, Latest Checkin Date: ${latestCheckinDateStr || 'None'}, Checkin Count: ${checkinCount}`);
+
+      if (latestCheckinDateStr && latestCheckinDateStr === todayStr) {
+        logger.info(`[Checkin] ℹ️ Today (${todayStr}) is already checked in for user ${user.uid}`);
+        this.addSystemLog(`ℹ️ 用户 ${user.uid} 今日已成功签到 (${latestCheckinDateStr})，跳过签到动作`, 'info');
+        return { success: false, reason: 'ALREADY_CHECKED_IN', date: latestCheckinDateStr, checkinData };
+      }
+
+      // Today is not checked in yet, determine target prize_sec_id using smart logic
+      const targetSecId = checkinCount + 1;
+      let targetPrize = checkinList.find((item) => item.prize_sec_id === targetSecId);
+
+      // Fallback: search for first item where date is empty
+      if (!targetPrize) {
+        targetPrize = checkinList.find((item) => !item.date || item.date.trim() === '');
+      }
+
+      if (!targetPrize) {
+        logger.warn(`[Checkin] No available checkin prize found for user ${user.uid}`);
+        this.addSystemLog(`⚠️ 用户 ${user.uid} 未找到可领取的签到礼包`, 'warning');
+        return { success: false, reason: 'NO_PRIZE_AVAILABLE', checkinData };
+      }
+
+      logger.info(`[Checkin] User ${user.uid} preparing to check in for Day ${targetPrize.prize_sec_id} (${targetPrize.prize_name}, Prize ID: ${targetPrize.prize_id})...`);
+      this.addSystemLog(`📝 正在为用户 ${user.uid} 执行第 ${targetPrize.prize_sec_id} 天签到 (${targetPrize.prize_name})...`, 'info');
+
+      let claimResult;
+      try {
+        claimResult = await apiService.checkinPrize(
+          targetPrize.prize_id,
+          user.uid,
+          userData.token,
+          user.accessKey,
+          user.machineId,
+          user.platform || 'mac'
+        );
+      } catch (error) {
+        if (error.message === 'TOKEN_EXPIRED') {
+          logger.warn(`[Checkin] Token expired during checkinPrize, refreshing...`);
+          userData = await this.refreshUserToken(user);
+          claimResult = await apiService.checkinPrize(
+            targetPrize.prize_id,
+            user.uid,
+            userData.token,
+            user.accessKey,
+            user.machineId,
+            user.platform || 'mac'
+          );
+        } else {
+          throw error;
+        }
+      }
+
+      logger.info(`[Checkin] ✅ User ${user.uid} checked in successfully for ${targetPrize.prize_name}`);
+      this.addSystemLog(
+        `✅ 用户 ${user.uid} 签到成功！获得: ${claimResult?.prize_name || targetPrize.prize_name} (${claimResult?.date || '刚刚'})`,
+        'success'
+      );
+
+      // Update Redis cache for checkin list after successful checkin
+      try {
+        const updatedCheckinData = await apiService.getCheckinList(
+          user.uid,
+          userData.token,
+          user.accessKey,
+          user.machineId,
+          user.platform || 'mac'
+        );
+        await redisClient.set(`checkin:${user.uid}`, JSON.stringify(updatedCheckinData));
+      } catch (e) {
+        logger.warn(`[Checkin] Non-critical error updating checkin cache: ${e.message}`);
+      }
+
+      broadcastToClients({
+        type: 'checkinCompleted',
+        uid: user.uid,
+        result: claimResult,
+        timestamp: new Date().toISOString(),
+      });
+
+      return { success: true, data: claimResult };
+    } catch (error) {
+      logger.error(`[Checkin] ❌ Checkin failed for user ${user.uid}:`, error.message);
+      this.addSystemLog(`❌ 用户 ${user.uid} 签到失败: ${error.message}`, 'error');
+      throw error;
+    }
+  }
+
+  /**
    * Execute daily sign-in for a user
    * 1. Fetch tasks once
    * 2. Process each task based on wait conditions
@@ -455,7 +610,6 @@ export class TaskScheduler {
       const execLabel = executionNumber === 1 ? 'First' : 'Second';
       logger.info(`[${execLabel}] Executing daily sign-in for user ${user.uid}`);
 
-
       // Get user data
       let userData = await this.getUserData(user.uid);
       if (!userData.token) {
@@ -464,6 +618,13 @@ export class TaskScheduler {
         if (!userData.token) {
           throw new Error('Failed to refresh token');
         }
+      }
+
+      // ===== STEP 0: EXECUTE CHECK-IN (NEW API & LOGIC) =====
+      try {
+        await this.executeCheckin(user, userData);
+      } catch (checkinErr) {
+        logger.error(`[${execLabel}] Check-in step encountered error for user ${user.uid}: ${checkinErr.message}`);
       }
 
       // ===== FIRST API CALL: GET TASKS (Only once per day) =====

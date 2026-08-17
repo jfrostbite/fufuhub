@@ -7,6 +7,7 @@ export default function Dashboard() {
   const [tasks, setTasks] = React.useState([]);
   const [userInfo, setUserInfo] = React.useState(null);
   const [rewards, setRewards] = React.useState(null);
+  const [checkinData, setCheckinData] = React.useState(null);
   const [logs, setLogs] = React.useState([]);
   const [showAddUser, setShowAddUser] = React.useState(false);
   const [ws, setWs] = React.useState(null);
@@ -33,7 +34,7 @@ export default function Dashboard() {
     const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const wsUrl = `${wsProtocol}//${window.location.hostname}:${wsPort}`;
     console.log('Connecting to WebSocket:', wsUrl);
-    
+
     const wsConnection = new WebSocket(wsUrl);
 
     wsConnection.onopen = () => {
@@ -84,13 +85,13 @@ export default function Dashboard() {
     loadUsers();
     loadSystemLogs();
     checkSchedulerStatus();
-    
+
     // Refresh system logs every 5 seconds
     const interval = setInterval(loadSystemLogs, 5000);
-    
+
     // Check scheduler status every 10 seconds
     const statusInterval = setInterval(checkSchedulerStatus, 10000);
-    
+
     return () => {
       clearInterval(interval);
       clearInterval(statusInterval);
@@ -173,6 +174,44 @@ export default function Dashboard() {
     }
   };
 
+  const loadCheckinData = async (uid) => {
+    try {
+      const response = await fetch(`/api/users/${uid}/checkin`);
+      const data = await response.json();
+      if (data.code === 0) {
+        setCheckinData(data.data);
+      } else {
+        console.warn('Failed to load checkin data:', data.message);
+        setCheckinData(null);
+      }
+    } catch (error) {
+      console.error('Failed to load checkin data:', error);
+      setCheckinData(null);
+    }
+  };
+
+  const handleExecuteCheckin = async (uid) => {
+    try {
+      addLog(`📅 Executing manual check-in for user ${uid}...`, 'info');
+      const response = await fetch(`/api/users/${uid}/checkin`, {
+        method: 'POST',
+      });
+      const data = await response.json();
+      if (data.code === 0) {
+        addLog(`✅ ${data.message}`, 'success');
+        await loadCheckinData(uid);
+        await loadUserInfo(uid);
+        await loadUserTasks(uid);
+        await loadUserRewards(uid);
+      } else {
+        addLog(`❌ Check-in failed: ${data.message}`, 'error');
+      }
+    } catch (error) {
+      console.error('Failed to execute checkin:', error);
+      addLog('Failed to execute check-in', 'error');
+    }
+  };
+
   const loadUserLogs = async (uid) => {
     try {
       const response = await fetch(`/api/users/${uid}/logs`);
@@ -198,6 +237,7 @@ export default function Dashboard() {
     loadUserTasks(user.uid);
     loadUserInfo(user.uid);
     loadUserRewards(user.uid);
+    loadCheckinData(user.uid);
     loadUserLogs(user.uid);
   };
 
@@ -290,7 +330,7 @@ export default function Dashboard() {
   const handleExecuteTasks = async (uid) => {
     try {
       addLog(`🚀 Starting manual task execution for user ${uid}...`, 'info');
-      
+
       const response = await fetch(`/api/users/${uid}/execute-tasks`, {
         method: 'POST',
       });
@@ -525,9 +565,8 @@ export default function Dashboard() {
               users.map((user) => (
                 <div
                   key={user.uid}
-                  className={`user-item ${
-                    selectedUser?.uid === user.uid ? 'active' : ''
-                  }`}
+                  className={`user-item ${selectedUser?.uid === user.uid ? 'active' : ''
+                    }`}
                   onClick={() => handleUserSelect(user)}
                 >
                   <div className="user-info">
@@ -584,6 +623,12 @@ export default function Dashboard() {
                 </div>
                 <div className="user-actions">
                   <button
+                    className="btn btn-warning"
+                    onClick={() => handleExecuteCheckin(selectedUser.uid)}
+                  >
+                    ✍️ 每日签到 (Check-in)
+                  </button>
+                  <button
                     className="btn btn-success"
                     onClick={() => handleExecuteTasks(selectedUser.uid)}
                   >
@@ -596,6 +641,50 @@ export default function Dashboard() {
                     🔄 Refresh Token
                   </button>
                 </div>
+              </div>
+
+              {/* Daily Check-in Section */}
+              <div className="section checkin-section">
+                <div className="checkin-header-bar">
+                  <h3>📅 每日签到状态 (Daily Check-in)</h3>
+                  <button
+                    className="btn btn-warning btn-sm"
+                    onClick={() => handleExecuteCheckin(selectedUser.uid)}
+                  >
+                    ✍️ 立即签到 (Manual Check-in)
+                  </button>
+                </div>
+                {checkinData && checkinData.checkin_list ? (
+                  <>
+                    <div className="checkin-summary">
+                      <span>已连签: <strong>{checkinData.checkin_count || 0}</strong> 天</span>
+                      <span>活动第: <strong>{checkinData.actvity_day_count || 0}</strong> 天</span>
+                    </div>
+                    <div className="checkin-grid">
+                      {checkinData.checkin_list.map((item) => {
+                        const isChecked = Boolean(item.date && item.date.trim() !== '');
+                        const isNext = !isChecked && item.prize_sec_id === (checkinData.checkin_count + 1);
+                        return (
+                          <div
+                            key={item.prize_id}
+                            className={`checkin-card ${isChecked ? 'completed' : ''} ${isNext ? 'next' : ''}`}
+                          >
+                            <span className="checkin-day">第 {item.prize_sec_id} 天</span>
+                            <span className="checkin-prize">{item.prize_name}</span>
+                            <span className="checkin-date">
+                              {isChecked ? item.date : '未签到'}
+                            </span>
+                            <span className={isChecked ? 'badge-checked' : isNext ? 'badge-pending' : 'badge-disabled'}>
+                              {isChecked ? '已签到' : isNext ? '待签到' : '未解锁'}
+                            </span>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </>
+                ) : (
+                  <p className="empty-state">尚未加载签到信息，可点击上方按钮加载或一键签到</p>
+                )}
               </div>
 
               {/* Tabs */}
@@ -637,9 +726,8 @@ export default function Dashboard() {
                           <div
                             className="progress-bar"
                             style={{
-                              width: `${
-                                (task.task_value / task.task_target) * 100
-                              }%`,
+                              width: `${(task.task_value / task.task_target) * 100
+                                }%`,
                             }}
                           />
                         </div>
@@ -723,7 +811,7 @@ export default function Dashboard() {
                         <div key={idx} className="reward-group">
                           <div className="reward-group-header">
                             <span className="expiry-date">
-                              📅 Expires: {new Date(group.expiryDate).toLocaleDateString()}
+                              📅 Expires: {group.expiryDate}
                             </span>
                             <span className="total-duration">
                               ⏱️ Total: <strong>{group.totalMinutes} minutes</strong>

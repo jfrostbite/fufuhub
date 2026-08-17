@@ -513,6 +513,111 @@ router.get('/users/:uid/rewards', async (req, res) => {
 });
 
 /**
+ * Get user check-in status & list
+ */
+router.get('/users/:uid/checkin', async (req, res) => {
+  try {
+    let { uid } = req.params;
+    uid = parseInt(uid, 10);
+
+    const userData = await redisClient.get(`user:${uid}`);
+    if (!userData) {
+      return res.status(404).json({
+        code: 404,
+        message: 'User not found',
+      });
+    }
+
+    const user = JSON.parse(userData);
+    let checkinData;
+
+    try {
+      checkinData = await apiService.getCheckinList(
+        user.uid,
+        user.token,
+        user.accessKey,
+        user.machineId,
+        user.platform || 'mac'
+      );
+    } catch (error) {
+      if (error.message === 'TOKEN_EXPIRED') {
+        const scheduler = getTaskScheduler();
+        if (scheduler) {
+          const updatedUserData = await scheduler.refreshUserToken(user);
+          user.token = updatedUserData.token;
+        }
+
+        checkinData = await apiService.getCheckinList(
+          user.uid,
+          user.token,
+          user.accessKey,
+          user.machineId,
+          user.platform || 'mac'
+        );
+      } else {
+        throw error;
+      }
+    }
+
+    // Save to Redis cache
+    await redisClient.set(`checkin:${uid}`, JSON.stringify(checkinData));
+
+    res.json({
+      code: 0,
+      data: checkinData,
+    });
+  } catch (error) {
+    logger.error('Failed to get check-in list:', error);
+    res.status(500).json({
+      code: 500,
+      message: error.message,
+    });
+  }
+});
+
+/**
+ * Manually trigger daily check-in for a user
+ */
+router.post('/users/:uid/checkin', async (req, res) => {
+  try {
+    let { uid } = req.params;
+    uid = parseInt(uid, 10);
+
+    const userData = await redisClient.get(`user:${uid}`);
+    if (!userData) {
+      return res.status(404).json({
+        code: 404,
+        message: 'User not found',
+      });
+    }
+
+    const user = JSON.parse(userData);
+    const scheduler = getTaskScheduler();
+
+    if (!scheduler) {
+      return res.status(500).json({
+        code: 500,
+        message: 'Task Scheduler not available',
+      });
+    }
+
+    const result = await scheduler.executeCheckin(user, user);
+
+    res.json({
+      code: 0,
+      message: result.success ? 'Check-in executed successfully' : 'Check-in skipped or already completed',
+      data: result,
+    });
+  } catch (error) {
+    logger.error('Failed to execute check-in:', error);
+    res.status(500).json({
+      code: 500,
+      message: error.message,
+    });
+  }
+});
+
+/**
  * Delete user
  */
 router.delete('/users/:uid', async (req, res) => {

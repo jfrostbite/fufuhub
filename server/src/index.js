@@ -99,38 +99,65 @@ httpServer.listen(PORT, async () => {
 });
 
 // Graceful shutdown
-process.on('SIGINT', async () => {
-  logger.info('Received SIGINT, shutting down gracefully...');
-  
-  if (taskScheduler) {
-    taskScheduler.stop();
-  }
-  
-  wss.close(() => {
-    logger.info('WebSocket server closed');
-  });
+let isShuttingDown = false;
 
-  httpServer.close(async () => {
-    await redisClient.disconnect();
-    logger.info('Server closed');
+async function handleShutdown(signal) {
+  if (isShuttingDown) {
+    logger.info(`Forced exit on repeated ${signal}`);
     process.exit(0);
-  });
-});
-
-process.on('SIGTERM', async () => {
-  logger.info('Received SIGTERM, shutting down gracefully...');
-  
-  if (taskScheduler) {
-    taskScheduler.stop();
+    return;
   }
-  
-  wss.close(() => {
-    logger.info('WebSocket server closed');
-  });
+  isShuttingDown = true;
+  logger.info(`Received ${signal}, shutting down gracefully...`);
 
-  httpServer.close(async () => {
-    await redisClient.disconnect();
-    logger.info('Server closed');
+  // Safety fallback timeout to guarantee process exit within 2s
+  const forceExitTimer = setTimeout(() => {
+    logger.warn('Shutdown timed out, forcing exit...');
     process.exit(0);
-  });
-});
+  }, 2000);
+  forceExitTimer.unref();
+
+  try {
+    if (taskScheduler) {
+      taskScheduler.stop();
+    }
+
+    // Terminate all WebSocket client connections
+    wsClients.forEach((ws) => {
+      try {
+        ws.terminate();
+      } catch (e) {}
+    });
+    wsClients.clear();
+
+    // Close WebSocket server
+    wss.close(() => {
+      logger.info('WebSocket server closed');
+    });
+
+    // Disconnect Redis client
+    try {
+      await redisClient.disconnect();
+      logger.info('Redis client disconnected');
+    } catch (err) {
+      logger.warn(`Redis disconnect warning: ${err.message}`);
+    }
+
+    // Close HTTP Server
+    httpServer.close(() => {
+      logger.info('HTTP Server closed');
+      process.exit(0);
+    });
+
+    // Fallback exit if HTTP server keep-alive connections linger
+    setTimeout(() => {
+      process.exit(0);
+    }, 800);
+  } catch (error) {
+    logger.error('Error during shutdown:', error.message);
+    process.exit(1);
+  }
+}
+
+process.on('SIGINT', () => handleShutdown('SIGINT'));
+process.on('SIGTERM', () => handleShutdown('SIGTERM'));

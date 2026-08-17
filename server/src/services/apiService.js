@@ -33,7 +33,7 @@ class APIService {
       'Host': 'h5-proxy.fdcompute.com',
       'Content-Type': 'application/json',
       'user-agent': 'Dart/3.5 (dart:io)',
-      'version': '1.10.1',
+      'version': '1.10.3',
       'accept-encoding': 'gzip',
       'machineid': options.machineId || '830504a3-d020-43af-b3e6-4c8690f5d6be',
       'accesskey': options.accessKey || '90f8699a-e0d9-4ed2-8796-4ad2af58c27c',
@@ -318,6 +318,92 @@ class APIService {
       }
     } catch (error) {
       logger.error('[orderhistory] ❌ Error:', error.message);
+      throw error;
+    }
+  }
+
+  /**
+   * Get checkin task list
+   * @param {number} uid - User ID
+   * @param {string} token - Authorization token
+   * @param {string} accessKey - Access Key
+   * @param {string} machineId - Machine ID
+   * @param {string} platform - Platform (mac/ios/android)
+   * @returns {Promise<object>} Checkin list body
+   */
+  async getCheckinList(uid, token, accessKey, machineId = '830504a3-d020-43af-b3e6-4c8690f5d6be', platform = 'mac') {
+    try {
+      logger.info(`[getcheckinlist] Fetching checkin list for uid: ${uid}`);
+
+      const response = await this.client.post(
+        '/v1/nika/client/getcheckinlist',
+        { uid },
+        {
+          headers: this.buildHeaders({
+            authorization: token,
+            accessKey,
+            machineId,
+            platform,
+          }),
+        }
+      );
+
+      if (response.data.ret.code === ERROR_CODES.SUCCESS) {
+        logger.info(`[getcheckinlist] ✅ Success for uid: ${uid}`);
+        return response.data.body;
+      } else if (response.data.ret.code === ERROR_CODES.TOKEN_EXPIRED) {
+        logger.warn('[getcheckinlist] Token expired, need refresh');
+        throw new Error('TOKEN_EXPIRED');
+      } else {
+        throw new Error(`API Error: ${response.data.ret.msg} (Code: ${response.data.ret.code})`);
+      }
+    } catch (error) {
+      logger.error('[getcheckinlist] ❌ Error:', error.message);
+      throw error;
+    }
+  }
+
+  /**
+   * Execute daily checkin prize claim
+   * @param {number} prizeId - Prize ID to claim
+   * @param {number} uid - User ID
+   * @param {string} token - Authorization token
+   * @param {string} accessKey - Access Key
+   * @param {string} machineId - Machine ID
+   * @param {string} platform - Platform
+   * @returns {Promise<object>} Checkin prize response body
+   */
+  async checkinPrize(prizeId, uid, token, accessKey, machineId = '830504a3-d020-43af-b3e6-4c8690f5d6be', platform = 'mac') {
+    try {
+      logger.info(`[checkinprize] Executing checkin prize ${prizeId} for uid: ${uid}`);
+
+      const response = await this.client.post(
+        '/v1/nika/client/checkinprize',
+        {
+          prize_id: prizeId,
+          uid,
+        },
+        {
+          headers: this.buildHeaders({
+            authorization: token,
+            accessKey,
+            machineId,
+            platform,
+          }),
+        }
+      );
+
+      if (response.data.ret.code === ERROR_CODES.SUCCESS) {
+        logger.info(`[checkinprize] ✅ Success for prize ${prizeId}, uid: ${uid}`);
+        return response.data.body;
+      } else if (response.data.ret.code === ERROR_CODES.TOKEN_EXPIRED) {
+        logger.warn('[checkinprize] Token expired, need refresh');
+        throw new Error('TOKEN_EXPIRED');
+      } else {
+        throw new Error(`API Error: ${response.data.ret.msg} (Code: ${response.data.ret.code})`);
+      }
+    } catch (error) {
+      logger.error('[checkinprize] ❌ Error:', error.message);
       throw error;
     }
   }
