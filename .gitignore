@@ -21,3 +21,5 @@ build/
 .pnp.*
 logs/
 redis-data/
+data/*.json
+!data/.gitkeep

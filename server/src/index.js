@@ -9,8 +9,12 @@ import { fileURLToPath } from 'url';
 
 import redisClient from './utils/redis.js';
 import { logger } from './utils/logger.js';
+import { syncUsersWithRedis } from './utils/userStorage.js';
+import { setWsClients, setTaskScheduler, broadcastToClients, getTaskScheduler } from './utils/context.js';
 import apiRoutes from './routes/api.js';
 import { TaskScheduler } from './services/taskScheduler.js';
+
+export { broadcastToClients, getTaskScheduler };
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -30,6 +34,7 @@ app.use(express.static(publicPath));
 
 // Store WebSocket clients
 const wsClients = new Set();
+setWsClients(wsClients);
 
 wss.on('connection', (ws) => {
   logger.info('New WebSocket client connected');
@@ -44,20 +49,6 @@ wss.on('connection', (ws) => {
     logger.error('WebSocket error:', error);
   });
 });
-
-// Broadcast message to all connected clients
-export function broadcastToClients(data) {
-  wsClients.forEach((client) => {
-    if (client.readyState === 1) { // WebSocket.OPEN = 1
-      client.send(JSON.stringify(data));
-    }
-  });
-}
-
-// Export taskScheduler for API control
-export function getTaskScheduler() {
-  return taskScheduler;
-}
 
 // Routes
 app.use('/api', apiRoutes);
@@ -76,8 +67,12 @@ async function initializeServices() {
     await redisClient.connect();
     logger.info('Connected to Redis');
 
+    // Synchronize persistent local users with Redis (disaster recovery & persistence)
+    await syncUsersWithRedis(redisClient);
+
     // Initialize Task Scheduler (but don't start automatically)
     taskScheduler = new TaskScheduler();
+    setTaskScheduler(taskScheduler);
     await taskScheduler.initialize();
     logger.info('Task Scheduler initialized (manual control mode)');
 

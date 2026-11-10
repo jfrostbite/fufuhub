@@ -1,8 +1,10 @@
 import schedule from 'node-schedule';
 import redisClient from '../utils/redis.js';
 import { logger } from '../utils/logger.js';
+import { getLocalUsers, getLocalUser, saveLocalUser } from '../utils/userStorage.js';
 import apiService from './apiService.js';
-import { broadcastToClients } from '../index.js';
+import { broadcastToClients } from '../utils/context.js';
+import { inMemoryLogs } from '../utils/logs.js';
 
 /**
  * 每天一次的签到任务调度器
@@ -35,14 +37,32 @@ export class TaskScheduler {
 
   async loadUsers() {
     try {
-      const usersJson = await redisClient.get('config:users');
-      if (usersJson) {
-        return JSON.parse(usersJson);
+      if (redisClient.isReady) {
+        const usersJson = await redisClient.get('config:users');
+        if (usersJson) {
+          const users = JSON.parse(usersJson);
+          if (Array.isArray(users) && users.length > 0) {
+            return users;
+          }
+        }
+      }
+      // Fallback to persistent local storage if Redis is empty, offline, or reset
+      const localUsers = getLocalUsers();
+      if (localUsers.length > 0) {
+        logger.info(`[TaskScheduler] Loaded ${localUsers.length} users from local storage fallback`);
+        if (redisClient.isReady) {
+          try {
+            await redisClient.set('config:users', JSON.stringify(localUsers));
+            for (const u of localUsers) {
+              await redisClient.set(`user:${u.uid}`, JSON.stringify(u));
+            }
+          } catch (e) {}
+        }
+        return localUsers;
       }
       return [];
     } catch (error) {
-      logger.error('Failed to load users:', error);
-      return [];
+      return getLocalUsers();
     }
   }
 
@@ -1163,14 +1183,28 @@ export class TaskScheduler {
           currentToken
         );
 
-        // Update token and save to Redis
+        // Update token and save to Redis & local storage
         userData.token = loginResult.token;
         userData.accessKey = loginResult.access_key || user.accessKey;
         userData.tokenUpdatedAt = new Date().toISOString();
 
+        saveLocalUser(userData);
         await redisClient.set(`user:${user.uid}`, JSON.stringify(userData));
 
-        logger.info(`[Token] Token refreshed and saved to Redis for user ${user.uid}`);
+        // Update config:users in Redis if present
+        try {
+          const usersJson = await redisClient.get('config:users');
+          if (usersJson) {
+            let users = JSON.parse(usersJson);
+            const idx = users.findIndex((u) => u.uid === user.uid);
+            if (idx >= 0) {
+              users[idx] = userData;
+              await redisClient.set('config:users', JSON.stringify(users));
+            }
+          }
+        } catch (e) {}
+
+        logger.info(`[Token] Token refreshed and saved to Redis & local storage for user ${user.uid}`);
 
         return userData; // Return updated userData
       } catch (error) {
@@ -1197,40 +1231,54 @@ export class TaskScheduler {
       if (userData) {
         return JSON.parse(userData);
       }
+      const localUser = getLocalUser(uid);
+      if (localUser) {
+        try {
+          await redisClient.set(`user:${uid}`, JSON.stringify(localUser));
+        } catch (e) {}
+        return localUser;
+      }
       return {};
     } catch (error) {
       logger.error(`Failed to get user data for ${uid}:`, error);
-      return {};
+      return getLocalUser(uid) || {};
     }
   }
 
   async addSystemLog(message, type = 'info') {
+    const newLog = {
+      id: Date.now(),
+      message,
+      type,
+      timestamp: new Date().toISOString(),
+    };
+
+    // Always maintain in-memory logs
+    inMemoryLogs.unshift(newLog);
+    if (inMemoryLogs.length > 100) {
+      inMemoryLogs.pop();
+    }
+
     try {
-      const logs = await redisClient.get('system:logs');
-      const logArray = logs ? JSON.parse(logs) : [];
-
-      const newLog = {
-        id: Date.now(),
-        message,
-        type,
-        timestamp: new Date().toISOString(),
-      };
-
-      // Keep only last 100 logs
-      logArray.unshift(newLog);
-      if (logArray.length > 100) {
-        logArray.pop();
+      if (redisClient.isReady) {
+        const logs = await redisClient.get('system:logs');
+        const logArray = logs ? JSON.parse(logs) : [];
+        logArray.unshift(newLog);
+        if (logArray.length > 100) {
+          logArray.pop();
+        }
+        await redisClient.set('system:logs', JSON.stringify(logArray));
       }
+    } catch (error) {
+      // Quietly ignore Redis write errors on disconnect
+    }
 
-      await redisClient.set('system:logs', JSON.stringify(logArray));
-
-      // Broadcast to WebSocket clients
+    // Always broadcast to WebSocket clients
+    try {
       broadcastToClients({
         type: 'systemLog',
         log: newLog,
       });
-    } catch (error) {
-      logger.error('Failed to add system log:', error);
-    }
+    } catch (e) {}
   }
 }

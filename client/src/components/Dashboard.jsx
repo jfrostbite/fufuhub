@@ -541,6 +541,7 @@ export default function Dashboard() {
                 }
               >
                 <option value="mac">macOS</option>
+                <option value="windows">Windows</option>
                 <option value="ios">iOS</option>
                 <option value="android">Android</option>
               </select>

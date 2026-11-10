@@ -1,10 +1,44 @@
 import express from 'express';
 import redisClient from '../utils/redis.js';
 import { logger } from '../utils/logger.js';
+import { getLocalUsers, getLocalUser, saveLocalUser, deleteLocalUser } from '../utils/userStorage.js';
+import { inMemoryLogs } from '../utils/logs.js';
 import apiService from '../services/apiService.js';
-import { broadcastToClients, getTaskScheduler } from '../index.js';
+import { broadcastToClients, getTaskScheduler } from '../utils/context.js';
 
 const router = express.Router();
+
+/**
+ * Helper to get user data from Redis or fallback to local persistent storage.
+ * Automatically restores Redis cache if local user exists.
+ */
+async function getUserOrFallback(uid) {
+  const targetUid = parseInt(uid, 10);
+  if (isNaN(targetUid)) return null;
+
+  if (redisClient.isReady) {
+    try {
+      const userDataStr = await redisClient.get(`user:${targetUid}`);
+      if (userDataStr) {
+        return JSON.parse(userDataStr);
+      }
+    } catch (err) {
+      // Quietly continue to local fallback
+    }
+  }
+
+  // Fallback to local persistent storage
+  const localUser = getLocalUser(targetUid);
+  if (localUser) {
+    if (redisClient.isReady) {
+      try {
+        await redisClient.set(`user:${targetUid}`, JSON.stringify(localUser));
+      } catch (e) {}
+    }
+    return localUser;
+  }
+  return null;
+}
 
 /**
  * Add or update user configuration
@@ -61,10 +95,13 @@ router.post('/users', async (req, res) => {
       logger.info(`[API] User provided token for uid ${uid}`);
     }
 
-    // Save user data
+    // Save to local persistent storage first
+    saveLocalUser(user);
+
+    // Save user data to Redis
     await redisClient.set(`user:${uid}`, JSON.stringify(user));
 
-    // Add to users list
+    // Add to users list in Redis
     let users = [];
     const usersJson = await redisClient.get('config:users');
     if (usersJson) {
@@ -105,18 +142,39 @@ router.post('/users', async (req, res) => {
  */
 router.get('/users', async (req, res) => {
   try {
-    const usersJson = await redisClient.get('config:users');
-    const users = usersJson ? JSON.parse(usersJson) : [];
+    let users = [];
+    if (redisClient.isReady) {
+      const usersJson = await redisClient.get('config:users');
+      if (usersJson) {
+        users = JSON.parse(usersJson);
+      }
+    }
+
+    // If Redis has no users or is offline, fallback to local storage
+    if (!users || users.length === 0) {
+      const localUsers = getLocalUsers();
+      if (localUsers.length > 0) {
+        users = localUsers;
+        if (redisClient.isReady) {
+          try {
+            await redisClient.set('config:users', JSON.stringify(users));
+            for (const u of users) {
+              await redisClient.set(`user:${u.uid}`, JSON.stringify(u));
+            }
+          } catch (e) {}
+        }
+      }
+    }
 
     res.json({
       code: 0,
       data: users,
     });
   } catch (error) {
-    logger.error('Failed to get users:', error);
-    res.status(500).json({
-      code: 500,
-      message: error.message,
+    const fallbackUsers = getLocalUsers();
+    res.json({
+      code: 0,
+      data: fallbackUsers,
     });
   }
 });
@@ -126,11 +184,9 @@ router.get('/users', async (req, res) => {
  */
 router.get('/users/:uid', async (req, res) => {
   try {
-    let { uid } = req.params;
-    uid = parseInt(uid, 10);
-    const userData = await redisClient.get(`user:${uid}`);
+    const user = await getUserOrFallback(req.params.uid);
 
-    if (!userData) {
+    if (!user) {
       return res.status(404).json({
         code: 404,
         message: 'User not found',
@@ -139,7 +195,7 @@ router.get('/users/:uid', async (req, res) => {
 
     res.json({
       code: 0,
-      data: JSON.parse(userData),
+      data: user,
     });
   } catch (error) {
     logger.error('Failed to get user:', error);
@@ -180,18 +236,14 @@ router.get('/users/:uid/tasks', async (req, res) => {
  */
 router.get('/users/:uid/info', async (req, res) => {
   try {
-    let { uid } = req.params;
-    uid = parseInt(uid, 10);
-
-    const userData = await redisClient.get(`user:${uid}`);
-    if (!userData) {
+    const uid = parseInt(req.params.uid, 10);
+    const user = await getUserOrFallback(uid);
+    if (!user) {
       return res.status(404).json({
         code: 404,
         message: 'User not found',
       });
     }
-
-    const user = JSON.parse(userData);
 
     // Get user info from API
     let userInfo;
@@ -348,20 +400,16 @@ router.get('/users/:uid/logs', async (req, res) => {
  */
 router.post('/users/:uid/refresh-token', async (req, res) => {
   try {
-    let { uid } = req.params;
-    uid = parseInt(uid, 10);
-
-    const userData = await redisClient.get(`user:${uid}`);
-    if (!userData) {
+    const user = await getUserOrFallback(req.params.uid);
+    if (!user) {
       return res.status(404).json({
         code: 404,
         message: 'User not found',
       });
     }
 
-    const user = JSON.parse(userData);
     const loginResult = await apiService.checkLogin(
-      uid,
+      user.uid,
       user.platform || 'mac',
       user.accessKey,
       user.machineId,
@@ -370,7 +418,22 @@ router.post('/users/:uid/refresh-token', async (req, res) => {
     user.token = loginResult.token;
     user.tokenUpdatedAt = new Date().toISOString();
 
-    await redisClient.set(`user:${uid}`, JSON.stringify(user));
+    // Persist to local storage & Redis
+    saveLocalUser(user);
+    await redisClient.set(`user:${user.uid}`, JSON.stringify(user));
+
+    // Update config:users in Redis if present
+    try {
+      const usersJson = await redisClient.get('config:users');
+      if (usersJson) {
+        let users = JSON.parse(usersJson);
+        const idx = users.findIndex((u) => u.uid === user.uid);
+        if (idx >= 0) {
+          users[idx] = user;
+          await redisClient.set('config:users', JSON.stringify(users));
+        }
+      }
+    } catch (err) {}
 
     res.json({
       code: 0,
@@ -392,18 +455,15 @@ router.post('/users/:uid/refresh-token', async (req, res) => {
  */
 router.get('/users/:uid/rewards', async (req, res) => {
   try {
-    let { uid } = req.params;
-    uid = parseInt(uid, 10);
-
-    const userData = await redisClient.get(`user:${uid}`);
-    if (!userData) {
+    const uid = parseInt(req.params.uid, 10);
+    const user = await getUserOrFallback(uid);
+    if (!user) {
       return res.status(404).json({
         code: 404,
         message: 'User not found',
       });
     }
 
-    const user = JSON.parse(userData);
     let orderData;
 
     try {
@@ -517,18 +577,14 @@ router.get('/users/:uid/rewards', async (req, res) => {
  */
 router.get('/users/:uid/checkin', async (req, res) => {
   try {
-    let { uid } = req.params;
-    uid = parseInt(uid, 10);
-
-    const userData = await redisClient.get(`user:${uid}`);
-    if (!userData) {
+    const user = await getUserOrFallback(req.params.uid);
+    if (!user) {
       return res.status(404).json({
         code: 404,
         message: 'User not found',
       });
     }
 
-    const user = JSON.parse(userData);
     let checkinData;
 
     try {
@@ -560,7 +616,7 @@ router.get('/users/:uid/checkin', async (req, res) => {
     }
 
     // Save to Redis cache
-    await redisClient.set(`checkin:${uid}`, JSON.stringify(checkinData));
+    await redisClient.set(`checkin:${user.uid}`, JSON.stringify(checkinData));
 
     res.json({
       code: 0,
@@ -580,18 +636,14 @@ router.get('/users/:uid/checkin', async (req, res) => {
  */
 router.post('/users/:uid/checkin', async (req, res) => {
   try {
-    let { uid } = req.params;
-    uid = parseInt(uid, 10);
-
-    const userData = await redisClient.get(`user:${uid}`);
-    if (!userData) {
+    const user = await getUserOrFallback(req.params.uid);
+    if (!user) {
       return res.status(404).json({
         code: 404,
         message: 'User not found',
       });
     }
 
-    const user = JSON.parse(userData);
     const scheduler = getTaskScheduler();
 
     if (!scheduler) {
@@ -625,13 +677,16 @@ router.delete('/users/:uid', async (req, res) => {
     let { uid } = req.params;
     uid = parseInt(uid, 10);
 
-    // Remove user data
+    // Remove from local persistent storage
+    deleteLocalUser(uid);
+
+    // Remove user data from Redis
     await redisClient.del(`user:${uid}`);
     await redisClient.del(`tasks:${uid}`);
     await redisClient.del(`logs:${uid}`);
     await redisClient.del(`token:${uid}:lastRefresh`);
 
-    // Remove from users list
+    // Remove from users list in Redis
     let users = [];
     const usersJson = await redisClient.get('config:users');
     if (usersJson) {
@@ -667,8 +722,8 @@ router.post('/users/:uid/tasks/:taskId/complete', async (req, res) => {
   try {
     const { uid, taskId } = req.params;
 
-    const userData = await redisClient.get(`user:${uid}`);
-    if (!userData) {
+    const user = await getUserOrFallback(uid);
+    if (!user) {
       return res.status(404).json({
         code: 404,
         message: 'User not found',
@@ -685,8 +740,6 @@ router.post('/users/:uid/tasks/:taskId/complete', async (req, res) => {
         message: 'Task not found',
       });
     }
-
-    const user = JSON.parse(userData);
     let result;
 
     try {
@@ -828,18 +881,27 @@ router.get('/scheduler/status', async (req, res) => {
  */
 router.get('/system/logs', async (req, res) => {
   try {
-    const logsJson = await redisClient.get('system:logs');
-    const logs = logsJson ? JSON.parse(logsJson) : [];
+    let logs = [];
+    if (redisClient.isReady) {
+      const logsJson = await redisClient.get('system:logs');
+      if (logsJson) {
+        logs = JSON.parse(logsJson);
+      }
+    }
+
+    // Fallback to in-memory logs if Redis returned empty or is offline
+    if ((!logs || logs.length === 0) && inMemoryLogs.length > 0) {
+      logs = inMemoryLogs;
+    }
 
     res.json({
       code: 0,
-      data: logs,
+      data: logs || [],
     });
   } catch (error) {
-    logger.error('Failed to get system logs:', error);
-    res.status(500).json({
-      code: 500,
-      message: error.message,
+    res.json({
+      code: 0,
+      data: inMemoryLogs || [],
     });
   }
 });
@@ -849,18 +911,15 @@ router.get('/system/logs', async (req, res) => {
  */
 router.post('/users/:uid/execute-tasks', async (req, res) => {
   try {
-    let { uid } = req.params;
-    uid = parseInt(uid, 10);
-
-    const userData = await redisClient.get(`user:${uid}`);
-    if (!userData) {
+    const uid = parseInt(req.params.uid, 10);
+    const user = await getUserOrFallback(uid);
+    if (!user) {
       return res.status(404).json({
         code: 404,
         message: 'User not found',
       });
     }
 
-    const user = JSON.parse(userData);
     const scheduler = getTaskScheduler();
     
     if (!scheduler) {
